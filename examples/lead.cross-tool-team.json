@@ -1,0 +1,5 @@
+{
+  "testCommand": "npm test",
+  "verifier": "claude",
+  "agents": ["claude", "codex", "antigravity"]
+}

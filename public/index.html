@@ -1,0 +1,151 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; connect-src 'self'; base-uri 'none'; frame-ancestors 'none'">
+  <title>Coordo Cloud Viewer</title>
+  <style>
+    :root { color-scheme: light dark; --bg: #f2f2f7; --card: #fff; --text: #171719; --muted: #6d6d72; --line: #dedee3; --accent: #1769e0; --danger: #b3261e; }
+    @media (prefers-color-scheme: dark) { :root { --bg: #000; --card: #1c1c1e; --text: #f5f5f7; --muted: #a2a2a7; --line: #38383a; --accent: #70a7ff; --danger: #ff8a80; } }
+    * { box-sizing: border-box; }
+    body { margin: 0; background: var(--bg); color: var(--text); font: 16px/1.45 -apple-system, BlinkMacSystemFont, "SF Pro Text", "Segoe UI", sans-serif; }
+    main { width: min(100% - 32px, 920px); margin: 0 auto; padding: max(28px, env(safe-area-inset-top)) 0 max(40px, env(safe-area-inset-bottom)); }
+    header { display: flex; align-items: end; justify-content: space-between; gap: 16px; margin-bottom: 24px; }
+    h1, h2, h3, p { margin: 0; }
+    h1 { font-size: clamp(28px, 6vw, 42px); letter-spacing: -.035em; }
+    h2 { font-size: 22px; letter-spacing: -.02em; }
+    h3 { font-size: 16px; }
+    .subtitle, .meta, .empty { color: var(--muted); }
+    .subtitle { margin-top: 5px; }
+    button { border: 1px solid var(--line); border-radius: 999px; background: var(--card); color: var(--text); padding: 9px 14px; font: inherit; cursor: pointer; }
+    button:disabled { opacity: .55; cursor: wait; }
+    #updated { margin-top: 12px; font-size: 13px; }
+    .repo { background: var(--card); border: 1px solid var(--line); border-radius: 22px; padding: 20px; margin-top: 16px; box-shadow: 0 2px 10px rgb(0 0 0 / 4%); }
+    .repo-head { display: flex; justify-content: space-between; align-items: start; gap: 12px; }
+    .repo-head a, .item a { color: var(--accent); text-decoration: none; }
+    .repo-head a:hover, .item a:hover { text-decoration: underline; }
+    .status { color: #27843b; font-size: 13px; white-space: nowrap; }
+    .status.bad { color: var(--danger); }
+    .group { margin-top: 20px; }
+    .group-title { padding-bottom: 7px; border-bottom: 1px solid var(--line); color: var(--muted); font-size: 13px; text-transform: uppercase; letter-spacing: .06em; }
+    .item { padding: 13px 0; border-bottom: 1px solid var(--line); }
+    .item:last-child { border-bottom: 0; padding-bottom: 0; }
+    .item-top { display: flex; gap: 8px; align-items: baseline; flex-wrap: wrap; }
+    .item-id { font-variant-numeric: tabular-nums; font-weight: 650; }
+    .item-summary { margin-top: 5px; white-space: pre-wrap; overflow-wrap: anywhere; }
+    .item-meta { margin-top: 6px; font-size: 13px; }
+    .error { color: var(--danger); margin-top: 12px; }
+    .empty { padding-top: 12px; }
+    @media (max-width: 520px) { main { width: min(100% - 22px, 920px); } header { align-items: start; flex-direction: column; } .repo { padding: 16px; border-radius: 18px; } }
+  </style>
+</head>
+<body>
+  <main>
+    <header>
+      <div>
+        <h1>Coordo</h1>
+        <p class="subtitle">A read-only view of project coordination ledgers.</p>
+        <p id="updated" class="meta">Loading ledgers…</p>
+      </div>
+      <button id="refresh" type="button">Refresh</button>
+    </header>
+    <section id="repositories" aria-live="polite"></section>
+  </main>
+  <script>
+    const repositories = document.getElementById('repositories');
+    const updated = document.getElementById('updated');
+    const refresh = document.getElementById('refresh');
+
+    function text(value) {
+      return typeof value === 'string' ? value : '';
+    }
+
+    function element(tag, className, value) {
+      const node = document.createElement(tag);
+      if (className) node.className = className;
+      if (value !== undefined) node.textContent = text(value);
+      return node;
+    }
+
+    function link(label, href) {
+      const node = element('a', '', label);
+      node.href = typeof href === 'string' && href.startsWith('https://github.com/') ? href : '#';
+      node.target = '_blank';
+      node.rel = 'noreferrer';
+      return node;
+    }
+
+    function renderItem(item, ledgerUrl) {
+      const row = element('article', 'item');
+      const top = element('div', 'item-top');
+      top.append(element('span', 'item-id', item.id));
+      top.append(link(item.summary || 'Open ledger', ledgerUrl));
+      row.append(top);
+      row.append(element('p', 'item-summary', item.body || item.summary || 'No description provided.'));
+      row.append(element('p', 'item-meta meta', [item.status, item.from + ' → ' + item.to, item.opened].filter(Boolean).join(' · ')));
+      return row;
+    }
+
+    function renderGroup(parent, title, items, ledgerUrl) {
+      const group = element('div', 'group');
+      group.append(element('h3', 'group-title', title));
+      items.forEach(item => group.append(renderItem(item, ledgerUrl)));
+      parent.append(group);
+    }
+
+    function groupByAssignee(items) {
+      return items.reduce((groups, item) => {
+        const key = item.to || 'default';
+        (groups[key] ||= []).push(item);
+        return groups;
+      }, {});
+    }
+
+    function renderRepository(repo) {
+      const card = element('article', 'repo');
+      const head = element('div', 'repo-head');
+      const title = element('div');
+      const heading = element('h2');
+      heading.append(link(repo.label, repo.ledgerUrl));
+      title.append(heading);
+      title.append(element('p', 'meta', repo.owner + '/' + repo.repo));
+      head.append(title);
+      head.append(element('span', repo.status === 'ok' ? 'status' : 'status bad', repo.status === 'ok' ? 'Available' : 'Unavailable'));
+      card.append(head);
+      if (repo.status !== 'ok') {
+        card.append(element('p', 'error', repo.error || 'Ledger unavailable.'));
+        return card;
+      }
+      const decisions = repo.decisions || [];
+      if (decisions.length) renderGroup(card, 'Open decisions', decisions, repo.ledgerUrl);
+      const groups = groupByAssignee(repo.tasks || []);
+      Object.keys(groups).sort().forEach(assignee => renderGroup(card, 'Tasks → ' + assignee, groups[assignee], repo.ledgerUrl));
+      if (!decisions.length && !(repo.tasks || []).length) card.append(element('p', 'empty', 'No open work recorded.'));
+      return card;
+    }
+
+    async function load() {
+      refresh.disabled = true;
+      updated.textContent = 'Loading ledgers…';
+      repositories.replaceChildren();
+      try {
+        const response = await fetch('/api/ledgers', { headers: { Accept: 'application/json' } });
+        if (!response.ok) throw new Error('Request failed');
+        const payload = await response.json();
+        (payload.repositories || []).forEach(repo => repositories.append(renderRepository(repo)));
+        if (!payload.repositories || !payload.repositories.length) repositories.append(element('p', 'empty', 'No repositories configured. Set COORDO_REPOS (for example "owner/repo,owner/other") in the deployment environment.'));
+        updated.textContent = payload.generatedAt ? 'Updated ' + new Date(payload.generatedAt).toLocaleString() : 'Updated just now';
+      } catch {
+        repositories.append(element('p', 'error', 'Could not load the ledgers. Try again.'));
+        updated.textContent = 'Unable to update';
+      } finally {
+        refresh.disabled = false;
+      }
+    }
+
+    refresh.addEventListener('click', load);
+    load();
+  </script>
+</body>
+</html>

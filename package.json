@@ -1,0 +1,47 @@
+{
+  "name": "coordo",
+  "version": "0.3.0",
+  "description": "A shared git-tracked ledger and autonomous dispatcher that lets several AI coding agents (Claude Code, Codex, Antigravity, or any CLI) work on one repo, across tools or as multiple roles inside one tool",
+  "keywords": [
+    "ai-agents",
+    "multi-agent",
+    "claude-code",
+    "codex",
+    "antigravity",
+    "coordination",
+    "cli"
+  ],
+  "license": "MIT",
+  "author": "Rishabh Raj",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/RishabhhR/coordo-framework.git"
+  },
+  "homepage": "https://github.com/RishabhhR/coordo-framework#readme",
+  "bugs": {
+    "url": "https://github.com/RishabhhR/coordo-framework/issues"
+  },
+  "type": "module",
+  "engines": {
+    "node": ">=20"
+  },
+  "bin": {
+    "coordo": "dist/cli.js"
+  },
+  "files": [
+    "dist",
+    "examples",
+    "LICENSE",
+    "README.md"
+  ],
+  "scripts": {
+    "build": "tsc && node scripts/postbuild.mjs",
+    "prepare": "npm run build",
+    "test": "npm run build && node --test tests/*.test.mjs",
+    "install-local": "npm run build && node scripts/install-local.mjs"
+  },
+  "devDependencies": {
+    "@types/node": "^22.9.0",
+    "typescript": "^5.6.3"
+  }
+}

@@ -1,0 +1,24 @@
+{
+  "testCommand": "npm test",
+  "verifier": "reviewer",
+  "agents": {
+    "architect": {
+      "adapter": "claude",
+      "model": "opus",
+      "role": "system design, module boundaries, interfaces and schemas",
+      "instructions": "Decide structure and write the contracts. Do not implement feature code or edit tests."
+    },
+    "builder": {
+      "adapter": "claude",
+      "model": "sonnet",
+      "role": "implementing features against the architect's interfaces",
+      "instructions": "Follow the interfaces exactly. If one is wrong, raise a decision instead of changing it."
+    },
+    "reviewer": {
+      "adapter": "claude",
+      "model": "haiku",
+      "role": "tests, code review and verification",
+      "instructions": "Check claims against the code. Report defects as tasks; never fix the author's code yourself."
+    }
+  }
+}

@@ -1,0 +1,4 @@
+node_modules
+dist
+.coordo/state.json
+.vercel

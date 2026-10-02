@@ -1,0 +1,16 @@
+{
+  "testCommand": "npm test",
+  "verifier": "reviewer",
+  "agents": {
+    "architect": { "adapter": "codex", "role": "architecture, schemas and low-level modules" },
+    "builder": { "adapter": "claude", "model": "sonnet", "role": "feature implementation" },
+    "reviewer": { "adapter": "claude", "model": "opus", "role": "review and verification" },
+    "mytool": {
+      "adapter": "command",
+      "bin": "my-agent-cli",
+      "args": ["--prompt-file", "{promptFile}"],
+      "role": "anything your own CLI is good at"
+    },
+    "designer": { "adapter": "handoff", "role": "UI design in a tool with no CLI; you paste the prompt" }
+  }
+}
