@@ -28,6 +28,12 @@ Agents in different tools can't see each other's work. You end up relaying promp
 
 Requires Node.js 20 or newer and git.
 
+Install globally from npm:
+```bash
+npm install -g @rishabhraj180402/coordo
+```
+
+Or build from source:
 ```bash
 git clone https://github.com/RishabhhR/coordo
 cd coordo
