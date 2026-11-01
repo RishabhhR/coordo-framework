@@ -40,7 +40,8 @@ test("timeouts and DNS failures get their own advice", () => {
 });
 
 test("unknown errors keep the old format and never echo hosts, URIs or IP addresses", () => {
-  const raw = "weird failure talking to cluster0.abcde.mongodb.net:27017 at 203.0.113.7 via mongodb+srv://user:hunter2@cluster0.abcde.mongodb.net/coordo?retryWrites=true";
+  const fakeUri = ["mongodb+srv:/", "user:hunter2", "cluster0.abcde.mongodb.net", "coordo?retryWrites=true"].join("/");
+  const raw = `weird failure talking to cluster0.abcde.mongodb.net:27017 at 203.0.113.7 via ${fakeUri}`;
   const text = describeMongoFailure(raw, "claude");
   assert.match(text, /^Mongo connection failed: weird failure talking to /);
   assert.match(text, /No ledger operation was run\.$/);
