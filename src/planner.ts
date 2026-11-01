@@ -3,6 +3,7 @@ import path from "node:path";
 import { claudeCommand, parseClaudeOutput, runProcess, runsDir, timestamp } from "./agents.js";
 import { addDecision, addTask, parseLedger } from "./ledger.js";
 import type { AgentName, LeadConfig } from "./leadConfig.js";
+import { routeModel, type ModelRouteDecision } from "./modelRouter.js";
 import { plannerPrompt } from "./prompts.js";
 
 export interface PlannedTask {
@@ -16,6 +17,8 @@ export interface Plan {
   /** Set when the planner needs a human to settle something before any work starts. */
   question?: string;
   costUsd?: number;
+  modelRoute?: ModelRouteDecision;
+  modelRouteWarning?: string;
 }
 
 // Accepts the planner's reply with or without code fences or stray prose
@@ -57,25 +60,35 @@ export function parsePlan(text: string, config: LeadConfig): Plan {
 export async function makePlan(root: string, goal: string, config: LeadConfig, planFile?: string): Promise<Plan> {
   if (planFile) return parsePlan(readFileSync(path.resolve(planFile), "utf-8"), config);
 
-  const ledger = parseLedger(root);
+  const ledger = await parseLedger(root);
   const prompt = plannerPrompt(goal, config, [...ledger.decisionsNeeded, ...ledger.tasks]);
   const logPath = path.join(runsDir(root), `${timestamp()}-planner.log`);
-  const result = await runProcess(claudeCommand(config, prompt, { planner: true }), root, logPath, config.runTimeoutMinutes * 60_000);
+  const routing = config.modelRouter.enabled
+    ? await routeModel(goal, "", "claude", config.modelRouter, { cwd: root })
+    : undefined;
+  const result = await runProcess(claudeCommand(config, prompt, { planner: true, model: routing?.decision?.model }), root, logPath, config.runTimeoutMinutes * 60_000);
   if (result.error || result.timedOut || result.exitCode !== 0) {
     throw new Error(`Planner (claude) failed: ${result.error ?? (result.timedOut ? "timed out" : `exit ${result.exitCode}`)}. Log: ${logPath}`);
   }
   const out = parseClaudeOutput(result.stdout);
   if (out.isError) throw new Error(`Planner (claude) reported an error: ${out.summary.slice(0, 300)}. Log: ${logPath}`);
-  return { ...parsePlan(out.summary, config), costUsd: out.costUsd };
+  return {
+    ...parsePlan(out.summary, config),
+    costUsd: out.costUsd,
+    modelRoute: routing?.decision,
+    modelRouteWarning: routing && "warning" in routing ? routing.warning : undefined,
+  };
 }
 
 // Writes the plan onto the ledger in order (the lead runs open tasks oldest
 // first, so ledger order is execution order). Returns the new ids.
-export function writePlan(root: string, goal: string, plan: Plan, runId: string, config: LeadConfig): string[] {
+export async function writePlan(root: string, goal: string, plan: Plan, runId: string, config: LeadConfig): Promise<string[]> {
   if (plan.question) {
-    return [addDecision(root, `${plan.question}\n\n(asked by the coordo-lead planner, run ${runId}, before planning: ${goal})`, "lead", config.human)];
+    return [await addDecision(root, `${plan.question}\n\n(asked by the coordo-lead planner, run ${runId}, before planning: ${goal})`, "lead", config.human)];
   }
-  return plan.tasks.map((t) =>
-    addTask(root, `${t.title}\n${t.description}\n\n(planned by coordo-lead run ${runId} for goal: ${goal})`, "lead", t.agent)
-  );
+  const ids: string[] = [];
+  for (const t of plan.tasks) {
+    ids.push(await addTask(root, `${t.title}\n${t.description}\n\n(planned by coordo-lead run ${runId} for goal: ${goal})`, "lead", t.agent));
+  }
+  return ids;
 }

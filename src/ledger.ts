@@ -1,5 +1,8 @@
 import { readFileSync, writeFileSync, existsSync, openSync, closeSync, unlinkSync, statSync } from "node:fs";
 import path from "node:path";
+import { withMongoLedger } from "./mongo.js";
+import { loadStorageConfig } from "./storage.js";
+import { recordDecisionCreated, recordDecisionResolved } from "./decisionLedger.js";
 
 // ---- Concurrency lock (fixes the read-modify-write race that silently dropped entries) ----
 // Zero-dependency mutex via O_EXCL lockfile. Every mutating op runs its full
@@ -55,6 +58,20 @@ function assertNoConflictMarkers(content: string, ledgerPath: string): void {
   }
 }
 
+function assertLosslessGitWrite(projectRoot: string): void {
+  const ledgerPath = path.join(projectRoot, ".coordo", "ledger.md");
+  const unsupported = readFileSync(ledgerPath, "utf-8")
+    .split(/\r?\n/)
+    .filter((line) => line.startsWith("### ") && !HEADER_REGEX.test(line));
+  if (unsupported.length > 0) {
+    throw new Error(
+      `Refusing to rewrite ${ledgerPath}: it contains unsupported Markdown item header(s) ` +
+      `that would be dropped. Rename each header to [TASK-###] or [DEC-###], or migrate to Mongo. ` +
+      `First header: ${unsupported[0].slice(0, 160)}`
+    );
+  }
+}
+
 export interface LedgerItem {
   id: string;
   status: string;
@@ -74,7 +91,7 @@ export interface Ledger {
 
 const HEADER_REGEX = /^###\s+\[([A-Z]+-\d+)\]\s+(.+)$/;
 
-export function parseLedger(projectRoot: string): Ledger {
+export function parseGitLedger(projectRoot: string): Ledger {
   const ledgerPath = path.join(projectRoot, ".coordo", "ledger.md");
   if (!existsSync(ledgerPath)) {
     throw new Error(`Ledger file not found at ${ledgerPath}. Run 'coordo init' first.`);
@@ -168,6 +185,30 @@ export function parseLedger(projectRoot: string): Ledger {
   };
 }
 
+export async function parseLedger(projectRoot: string): Promise<Ledger> {
+  const storage = loadStorageConfig(projectRoot);
+  if (storage.backend === "mongo") {
+    return withMongoLedger(storage.ledgerId, (store) => store.read());
+  }
+  return parseGitLedger(projectRoot);
+}
+
+export async function migrateMongo(projectRoot: string, ledgerId: string): Promise<{ items: number }> {
+  const ledger = parseGitLedger(projectRoot);
+  const archive = readFileSync(path.join(projectRoot, ".coordo", "ledger.md"), "utf-8");
+  return withMongoLedger(ledgerId, (store) => store.migrate(ledger, ".coordo/ledger.md", archive));
+}
+
+export async function syncMongo(projectRoot: string, ledgerId: string): Promise<{ added: number; skipped: number }> {
+  const ledger = parseGitLedger(projectRoot);
+  const archive = readFileSync(path.join(projectRoot, ".coordo", "ledger.md"), "utf-8");
+  return withMongoLedger(ledgerId, (store) => store.sync(ledger, archive));
+}
+
+export async function analyticsMongo(ledgerId: string): Promise<Record<string, unknown>> {
+  return withMongoLedger(ledgerId, (store) => store.analytics());
+}
+
 export function serializeItem(item: LedgerItem): string {
   const parts = [`### [${item.id}]`];
   parts.push(`status:${item.status}`);
@@ -225,20 +266,25 @@ export function allocateId(ledger: Ledger, prefix: "DEC" | "TASK"): string {
   return `${prefix}-${String(maxNum + 1).padStart(3, "0")}`;
 }
 
-export function addDecision(
+export async function addDecision(
   projectRoot: string,
   question: string,
   from: string,
   to: string,
   context?: string
-): string {
+): Promise<string> {
+  const storage = loadStorageConfig(projectRoot);
+  let body = `**Question:** ${sanitizeBody(question)}`;
+  if (context) body += `\n\nContext: ${sanitizeBody(context)}`;
+  if (storage.backend === "mongo") {
+    const id = await withMongoLedger(storage.ledgerId, (store) => store.add("decisions", body, from, to));
+    recordDecisionCreated(projectRoot, { id, question, from, to, context });
+    return id;
+  }
   return withLock(projectRoot, () => {
-    const ledger = parseLedger(projectRoot);
+    assertLosslessGitWrite(projectRoot);
+    const ledger = parseGitLedger(projectRoot);
     const id = allocateId(ledger, "DEC");
-    let body = `**Question:** ${sanitizeBody(question)}`;
-    if (context) {
-      body += `\n\nContext: ${sanitizeBody(context)}`;
-    }
     const item: LedgerItem = {
       id,
       status: "open",
@@ -255,18 +301,45 @@ export function addDecision(
     };
     ledger.decisionsNeeded.unshift(item);
     serializeLedger(projectRoot, ledger);
+    recordDecisionCreated(projectRoot, { id, question, from, to, context });
     return id;
   });
 }
 
-export function answerDecision(
+export async function answerDecision(
   projectRoot: string,
   id: string,
   answer: string,
-  by?: string
-): void {
+  by?: string,
+  extra?: {
+    rationale?: string;
+    options?: string[];
+    creditsCost?: number;
+  }
+): Promise<void> {
+  const storage = loadStorageConfig(projectRoot);
+  const resolver = by || "default";
+  if (storage.backend === "mongo") {
+    let mongoAnswer = sanitizeBody(answer);
+    if (extra?.options && extra.options.length > 0) {
+      mongoAnswer += `\n\nOptions Considered: ${extra.options.map(sanitizeBody).join(", ")}`;
+    }
+    if (extra?.rationale) {
+      mongoAnswer += `\n\nRationale: ${sanitizeBody(extra.rationale)}`;
+    }
+    await withMongoLedger(storage.ledgerId, (store) => store.answerDecision(id, mongoAnswer, resolver));
+    recordDecisionResolved(projectRoot, id, {
+      answer,
+      by: resolver,
+      rationale: extra?.rationale,
+      optionsConsidered: extra?.options,
+      creditsCost: extra?.creditsCost,
+    });
+    return;
+  }
   withLock(projectRoot, () => {
-    const ledger = parseLedger(projectRoot);
+    assertLosslessGitWrite(projectRoot);
+    const ledger = parseGitLedger(projectRoot);
     const index = ledger.decisionsNeeded.findIndex(item => item.id === id);
     if (index === -1) {
       throw new Error(`Open decision with ID ${id} not found.`);
@@ -275,23 +348,42 @@ export function answerDecision(
     item.status = "resolved";
     item.metadata.status = "resolved";
 
-    const resolver = by || item.to;
+    const actualResolver = by || item.to;
     const time = new Date().toISOString().slice(0, 16) + "Z";
-    item.body += `\n\n**Answer (by ${resolver}, ${time}):** ${sanitizeBody(answer)}`;
+    let addition = `\n\n**Answer (by ${actualResolver}, ${time}):** ${sanitizeBody(answer)}`;
+    if (extra?.options && extra.options.length > 0) {
+      addition += `\n\n**Options Considered:** ${extra.options.map(sanitizeBody).join(", ")}`;
+    }
+    if (extra?.rationale) {
+      addition += `\n\n**Rationale:** ${sanitizeBody(extra.rationale)}`;
+    }
+    item.body += addition;
 
     ledger.resolvedLog.unshift(item);
     serializeLedger(projectRoot, ledger);
+    recordDecisionResolved(projectRoot, id, {
+      answer,
+      by: actualResolver,
+      rationale: extra?.rationale,
+      optionsConsidered: extra?.options,
+      creditsCost: extra?.creditsCost,
+    });
   });
 }
 
-export function addTask(
+export async function addTask(
   projectRoot: string,
   description: string,
   from: string,
   to: string
-): string {
+): Promise<string> {
+  const storage = loadStorageConfig(projectRoot);
+  if (storage.backend === "mongo") {
+    return withMongoLedger(storage.ledgerId, (store) => store.add("tasks", sanitizeBody(description), from, to));
+  }
   return withLock(projectRoot, () => {
-    const ledger = parseLedger(projectRoot);
+    assertLosslessGitWrite(projectRoot);
+    const ledger = parseGitLedger(projectRoot);
     const id = allocateId(ledger, "TASK");
     const item: LedgerItem = {
       id,
@@ -313,13 +405,18 @@ export function addTask(
   });
 }
 
-export function resolveTask(
+export async function resolveTask(
   projectRoot: string,
   id: string,
   note?: string
-): void {
+): Promise<void> {
+  const storage = loadStorageConfig(projectRoot);
+  if (storage.backend === "mongo") {
+    return withMongoLedger(storage.ledgerId, (store) => store.resolveTask(id, note ? sanitizeBody(note) : undefined));
+  }
   withLock(projectRoot, () => {
-    const ledger = parseLedger(projectRoot);
+    assertLosslessGitWrite(projectRoot);
+    const ledger = parseGitLedger(projectRoot);
     const index = ledger.tasks.findIndex(item => item.id === id);
     if (index === -1) {
       throw new Error(`Open task with ID ${id} not found.`);

@@ -214,7 +214,7 @@ test("--dry-run writes nothing and runs no agent, even with the goal after the f
   const before = ledger(dir);
   const noGoal = runCli(dir, ["lead", "--dry-run"]);
   assert.equal(noGoal.status, 0, noGoal.output);
-  assert.match(noGoal.output, /TASK-001 → codex: Write the parser\n\s+via .*fake-bin\/codex exec --cd/);
+  assert.match(noGoal.output, /TASK-001 → codex: Write the parser\n(?:\s+(?:routed|routing fallback:) [^\n]+\n)?\s+via .*fake-bin\/codex exec --cd/);
 
   const plan = JSON.stringify({ tasks: [{ agent: "codex", title: "Planned", description: "p" }] });
   const withGoal = runCli(dir, ["lead", "--dry-run", "Build it"], { FAKE_PLAN: plan });

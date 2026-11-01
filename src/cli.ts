@@ -7,19 +7,26 @@ import {
   parseLedger, 
   addDecision, 
   answerDecision, 
-  addTask, 
-  resolveTask 
+  addTask,
+  resolveTask,
+  migrateMongo,
+  syncMongo,
+  analyticsMongo
 } from "./ledger.js";
 import { readState, getCheckpoint, setCheckpoint } from "./state.js";
 import { getGitHead, runGitDigest } from "./git.js";
 import { loadLeadConfig, resolveProfile } from "./leadConfig.js";
 import { dispatch } from "./agents.js";
-import { rawPrompt, workerPrompt } from "./prompts.js";
+import { isVerifyTask, rawPrompt, workerPrompt, consultPrompt } from "./prompts.js";
 import { makePlan, writePlan } from "./planner.js";
 import { runLead } from "./lead.js";
+import { checkMongo, ensureMongoIndexes } from "./mongo.js";
+import { routeModel } from "./modelRouter.js";
+import { loadCredits, addCredits, transferCredits, checkCreditAvailable, deductCredits, estimateCost } from "./credits.js";
+import { getDecisionRecord, listDecisionRecords, formatDecisionRecord, recordDeliberationTurn } from "./decisionLedger.js";
 
 // Flags that never take a value, so `--dry-run "<goal>"` doesn't swallow the goal.
-const BOOLEAN_FLAGS = new Set(["full", "dry-run", "wait", "allow-dirty"]);
+const BOOLEAN_FLAGS = new Set(["full", "dry-run", "wait", "allow-dirty", "auto-decide"]);
 
 // Exit codes for `coordo lead` so scripts can tell why it stopped.
 const LEAD_EXIT_CODES = { complete: 0, planned: 0, paused: 3, stuck: 4 } as const;
@@ -77,7 +84,7 @@ function formatAge(openedStr: string): string {
 
 function printHelp() {
   console.log(`
-coordo — a shared ledger and dispatcher that lets several AI coding agents work on one repo
+coordo — a shared ledger, credit manager, and autonomous dispatcher for multi-agent teams
 
 Usage:
   coordo <command> [options]
@@ -89,31 +96,54 @@ Commands:
   task list [--status open|done|all] [--to <name>]        List tasks.
   task done <id> [--note "<done note>"]                   Mark a task as completed.
   decision add "<question>" --from <name> --to <name>     Add a new decision question.
-  decision answer <id> "<answer>" [--by <name>]           Answer an open decision question.
+  decision answer <id> "<answer>" [--by <name>]           Answer an open decision question with optional rationale.
   decision list [--status open|resolved|all]              List decisions.
+  decision show <id>                                      Show decision detail, rationale, and deliberation trail.
+  decision log                                            Display audit log of agent decision-making.
   digest [--as <name>] [--full]                           Show Git logs or diffs since the caller's last checkpoint.
   checkpoint [--as <name>] [--ref <sha>]                  Record current HEAD (or custom ref) as caller's checkpoint.
+
+Inter-agent communication & Invocation:
+  invoke <agent> "<prompt>" [--task-id <id>] [--dry-run]  Programmatically invoke a peer agent headlessly.
+  consult <agent> "<question>" [--from <caller>]          Consult a peer agent, deliberate, and record rationale.
+                                                          Use --auto-decide to resolve into a ledger decision.
+
+Credit & budget management:
+  credit status                                           Show agent credit balances, limits, and total spent.
+  credit add <agent|all> <amount> [--note <msg>]          Add credits to an agent or all agents.
+  credit transfer <from> <to> <amount> [--note <msg>]     Transfer credits from one agent to another.
+  credit history [--agent <name>]                         Show transaction ledger of credit deductions.
 
 Autonomous lead (config: .coordo/lead.json, logs: .coordo/runs/):
   lead ["<goal>"] [--plan-file <json>] [--max-steps N] [--wait] [--allow-dirty] [--dry-run]
                                                           Plan the goal into ledger tasks, then run the agents until
-                                                          every task is closed and verified. Without a goal, drives
-                                                          the open tasks already on the ledger. Alias: auto.
+                                                          every task and decision is closed and verified.
   plan "<goal>" [--plan-file <json>] [--dry-run]          Only plan: write the goal's tasks to the ledger.
   dispatch <agent> <TASK-ID|"prompt"> [--dry-run]
                                                           Run one agent headlessly on one task or prompt.
 
+Storage backend:
+  mongo migrate [--ledger-id <id>]                        Import the current Markdown ledger into Mongo once.
+  mongo sync [--ledger-id <id>]                           Capture newer archive entries after migration.
+  mongo analytics [--ledger-id <id>]                      Read aggregate health metrics from Mongo.
+  mongo check [--ledger-id <id>]                          Run a read-only Mongo ping and report latency.
+  mongo ensure-indexes [--ledger-id <id>]                 Create the Coordo indexes (explicit maintenance operation).
+  mongo export [--out <file>]                            Explicitly export the Mongo ledger for backup.
+
 Options:
-  --as <name>      Assert caller identity (defaults to "default").
-  --from <name>    Sender identity.
-  --to <name>      Recipient identity.
-  --status <val>   Filter by status (open, done, resolved, all).
-  --note <msg>     Add a closure note.
-  --ref <sha>      Specify custom git SHA ref.
-  --full           Show full git diff instead of summary stat logs.
-  --dry-run        Show what lead/plan/dispatch would do without writing the ledger or running agents.
-  --wait           lead: when a human decision blocks the run, wait for the answer instead of exiting.
-  --allow-dirty    lead: start even with uncommitted changes (they are committed with the first closed task).
+  --as <name>        Assert caller identity (defaults to "default").
+  --from <name>      Sender identity.
+  --to <name>        Recipient identity.
+  --status <val>     Filter by status (open, done, resolved, all).
+  --note <msg>       Add a closure or transaction note.
+  --rationale <msg>  Add explicit decision rationale.
+  --options <opts>   Comma-separated list of options considered.
+  --ref <sha>        Specify custom git SHA ref.
+  --full             Show full git diff instead of summary stat logs.
+  --auto-decide      Automatically allocate and resolve decision from consultation.
+  --dry-run          Show what would run without executing or writing to disk.
+  --wait             lead: when a human decision blocks the run, wait for the answer instead of exiting.
+  --allow-dirty      lead: start even with uncommitted changes (they are committed with the first closed task).
 
 Exit codes for lead: 0 complete, 3 paused on a human decision, 4 stuck (attempts or --max-steps used up).
 `);
@@ -122,6 +152,8 @@ Exit codes for lead: 0 complete, 3 paused on a human decision, 4 stuck (attempts
 async function main() {
   const root = findProjectRoot();
   const { positionals, flags } = parseArgs(process.argv.slice(2));
+  const identity = (flags.as ?? flags.from) as string | undefined;
+  if (identity) process.env.COORDO_AGENT = identity;
   
   if (positionals.length === 0) {
     printHelp();
@@ -143,7 +175,7 @@ async function main() {
       }
 
       case "status": {
-        const ledger = parseLedger(root);
+        const ledger = await parseLedger(root);
         console.log("=== Coordo Status ===\n");
         console.log("💡 Decisions Needed:");
         if (ledger.decisionsNeeded.length === 0) {
@@ -157,10 +189,11 @@ async function main() {
 
         console.log("\n📋 Open Tasks Count:");
         const counts: Record<string, number> = {};
-        for (const t of ledger.tasks) {
+        const openTasks = ledger.tasks.filter((t) => t.status === "open");
+        for (const t of openTasks) {
           counts[t.to] = (counts[t.to] || 0) + 1;
         }
-        if (ledger.tasks.length === 0) {
+        if (openTasks.length === 0) {
           console.log("  No open tasks.");
         } else {
           for (const [to, count] of Object.entries(counts)) {
@@ -197,15 +230,15 @@ async function main() {
           if (!desc) throw new Error("Missing task description.");
           const from = (flags.from as string) || "default";
           const to = (flags.to as string) || "default";
-          const id = addTask(root, desc, from, to);
+          const id = await addTask(root, desc, from, to);
           console.log(`✅ Allocated ${id} for new task.`);
         } else if (sub === "list") {
           const targetStatus = (flags.status as string) || "open";
           const targetTo = flags.to as string | undefined;
-          const ledger = parseLedger(root);
+          const ledger = await parseLedger(root);
           
           let items = targetStatus === "open" 
-            ? ledger.tasks 
+            ? ledger.tasks.filter((t) => t.status === "open")
             : targetStatus === "done" 
               ? ledger.resolvedLog.filter(t => t.id.startsWith("TASK"))
               : [...ledger.tasks, ...ledger.resolvedLog.filter(t => t.id.startsWith("TASK"))];
@@ -226,7 +259,7 @@ async function main() {
           const id = positionals[2];
           if (!id) throw new Error("Missing task ID (e.g. TASK-001).");
           const note = flags.note as string | undefined;
-          resolveTask(root, id, note);
+          await resolveTask(root, id, note);
           console.log(`✅ Marked task ${id} as done.`);
         } else {
           console.log("Unknown task command. Supported: add, list, done");
@@ -242,18 +275,54 @@ async function main() {
           const from = (flags.from as string) || "default";
           const to = (flags.to as string) || "default";
           const context = flags.context as string | undefined;
-          const id = addDecision(root, question, from, to, context);
+          const id = await addDecision(root, question, from, to, context);
           console.log(`✅ Allocated ${id} for new decision.`);
         } else if (sub === "answer") {
           const id = positionals[2];
           const ans = positionals[3];
-          if (!id || !ans) throw new Error("Usage: coordo decision answer <id> \"<answer>\" [--by <name>]");
+          if (!id || !ans) throw new Error("Usage: coordo decision answer <id> \"<answer>\" [--by <name>] [--rationale <msg>] [--options <opts>]");
           const by = flags.by as string | undefined;
-          answerDecision(root, id, ans, by);
+          const rationale = flags.rationale as string | undefined;
+          const rawOptions = flags.options as string | undefined;
+          const options = rawOptions ? rawOptions.split(",").map((s) => s.trim()).filter(Boolean) : undefined;
+          const creditsCost = flags["credits-cost"] !== undefined ? Number(flags["credits-cost"]) : undefined;
+          await answerDecision(root, id, ans, by, { rationale, options, creditsCost });
           console.log(`✅ Resolved decision ${id} with answer.`);
+        } else if (sub === "show") {
+          const id = positionals[2];
+          if (!id) throw new Error("Usage: coordo decision show <id>");
+          const record = getDecisionRecord(root, id);
+          if (record) {
+            console.log(formatDecisionRecord(record));
+          } else {
+            const ledger = await parseLedger(root);
+            const item = [...ledger.decisionsNeeded, ...ledger.resolvedLog].find((d) => d.id === id);
+            if (!item) throw new Error(`Decision ${id} not found.`);
+            console.log(`=== Decision ${item.id} ===\nStatus: ${item.status}\nFrom: ${item.from} -> To: ${item.to}\nOpened: ${item.opened}\n\n${item.body}`);
+          }
+        } else if (sub === "log") {
+          const records = listDecisionRecords(root);
+          if (records.length === 0) {
+            console.log("No decisions recorded in decision ledger.");
+          } else {
+            console.log("=== Autonomous Decision-Making Ledger ===\n");
+            for (const r of records) {
+              const rationaleSnippet = r.rationale ? ` | Rationale: ${r.rationale.slice(0, 70)}…` : "";
+              const cost = r.creditsCost !== undefined ? ` [$${r.creditsCost.toFixed(3)}]` : "";
+              console.log(`${r.id.padEnd(9)} [${r.status.padEnd(10)}] from:${r.from.padEnd(11)} to:${r.to.padEnd(11)}${cost} | ${r.question.split("\n")[0].slice(0, 50)}${rationaleSnippet}`);
+            }
+          }
+        } else if (sub === "turn" || sub === "debate") {
+          const id = positionals[2];
+          const msg = positionals[3];
+          if (!id || !msg) throw new Error('Usage: coordo decision turn <id> "<message>" --from <agent> [--role <proposer|respondent|critic>]');
+          const from = (flags.from as string) || (flags.as as string) || "default";
+          const role = flags.role as "proposer" | "respondent" | "critic" | "arbiter" | undefined;
+          recordDeliberationTurn(root, id, { speaker: from, message: msg, role });
+          console.log(`✅ Recorded deliberation turn on ${id} by ${from}.`);
         } else if (sub === "list") {
           const targetStatus = (flags.status as string) || "open";
-          const ledger = parseLedger(root);
+          const ledger = await parseLedger(root);
           
           const items = targetStatus === "open"
             ? ledger.decisionsNeeded
@@ -270,7 +339,7 @@ async function main() {
             }
           }
         } else {
-          console.log("Unknown decision command. Supported: add, list, answer");
+          console.log("Unknown decision command. Supported: add, list, show, log, turn, answer");
         }
         break;
       }
@@ -298,18 +367,33 @@ async function main() {
         const target = positionals[2];
         if (!agent || !target) throw new Error('Usage: coordo dispatch <agent> <TASK-ID|"prompt"> [--dry-run]');
         const config = loadLeadConfig(root);
-        resolveProfile(config, agent); // throws a helpful error for an unknown agent name
+        const profile = resolveProfile(config, agent); // throws a helpful error for an unknown agent name
         let prompt: string;
+        let routeTask = target;
+        let routeContext = "";
         let taskId: string | undefined;
         if (/^TASK-\d+$/.test(target)) {
-          const task = parseLedger(root).tasks.find((t) => t.id === target);
+          const task = (await parseLedger(root)).tasks.find((t) => t.id === target);
           if (!task) throw new Error(`Open task ${target} not found.`);
           taskId = task.id;
           prompt = workerPrompt(task, agent, root, config);
+          routeTask = isVerifyTask(task) ? `Review and verify ${task.body.split("\n")[0]}` : task.body.split("\n")[0];
+          routeContext = task.body;
         } else {
           prompt = rawPrompt(target, agent, root);
         }
-        const result = await dispatch(agent, prompt, { root, config, taskId, dryRun: !!flags["dry-run"] });
+        const routing = config.modelRouter.enabled && !profile.model
+          ? await routeModel(routeTask, routeContext, profile.adapter, config.modelRouter, { cwd: root })
+          : undefined;
+        const model = routing?.decision?.model;
+        if (routing?.decision) {
+          console.log(`model-router → ${routing.decision.provider}/${routing.decision.model} (${routing.decision.tier}; ${routing.decision.reasons.join("; ")})`);
+        } else if (routing && "warning" in routing) {
+          console.log(`model-router unavailable; using configured model for ${agent}: ${routing.warning}`);
+        } else if (profile.model) {
+          console.log(`model pinned by ${agent} profile: ${profile.model}`);
+        }
+        const result = await dispatch(agent, prompt, { root, config, taskId, model, dryRun: !!flags["dry-run"] });
         if (result.mode === "dry-run") {
           console.log(`Would run: ${result.summary}\n--- prompt ---\n${prompt}`);
           break;
@@ -321,6 +405,189 @@ async function main() {
         break;
       }
 
+      case "invoke": {
+        const agent = positionals[1];
+        const promptText = positionals[2];
+        if (!agent || !promptText) throw new Error('Usage: coordo invoke <agent> "<prompt>" [--task-id <id>] [--from <caller>] [--dry-run]');
+        const config = loadLeadConfig(root);
+        const caller = (flags.from as string) || (flags.as as string) || "agent";
+        
+        if (config.credits?.enabled && config.credits?.enforceLimits) {
+          const check = checkCreditAvailable(root, caller, 0.001, config);
+          if (!check.ok) {
+            throw new Error(`Caller '${caller}' has insufficient credits: ${check.balance.toFixed(3)} remaining.`);
+          }
+        }
+
+        resolveProfile(config, agent);
+        const prompt = rawPrompt(promptText, agent, root);
+        const taskId = flags["task-id"] as string | undefined;
+
+        console.log(`🤖 Invoking ${agent} (from ${caller})...`);
+        const result = await dispatch(agent, prompt, { root, config, taskId, dryRun: !!flags["dry-run"] });
+
+        if (result.mode === "dry-run") {
+          console.log(`Would invoke ${agent}: ${result.summary}`);
+          break;
+        }
+
+        const cost = estimateCost(result.durationMs, result.costUsd, config.credits?.costPerSecondEstimate);
+        deductCredits(root, caller, cost, "invoke", taskId, `Invoked ${agent}`, config);
+
+        console.log(`${result.ok ? "✅" : "❌"} ${agent} finished (${result.durationMs}ms, $${cost.toFixed(3)} credits)`);
+        if (result.summary) console.log(`\n${result.summary}`);
+        if (!result.ok) process.exitCode = 1;
+        break;
+      }
+
+      case "consult": {
+        const agent = positionals[1];
+        const question = positionals[2];
+        if (!agent || !question) throw new Error('Usage: coordo consult <agent> "<question>" [--from <caller>] [--context "<context>"] [--auto-decide] [--dry-run]');
+        const config = loadLeadConfig(root);
+        const caller = (flags.from as string) || (flags.as as string) || "peer";
+        const context = flags.context as string | undefined;
+        const autoDecide = !!flags["auto-decide"];
+
+        if (config.credits?.enabled && config.credits?.enforceLimits) {
+          const check = checkCreditAvailable(root, caller, 0.001, config);
+          if (!check.ok) {
+            throw new Error(`Caller '${caller}' has insufficient credits: ${check.balance.toFixed(3)} remaining.`);
+          }
+        }
+
+        console.log(`💬 ${caller} consulting ${agent} on: "${question}"`);
+        const prompt = consultPrompt(question, caller, agent, root, context);
+        const result = await dispatch(agent, prompt, { root, config, dryRun: !!flags["dry-run"] });
+
+        if (result.mode === "dry-run") {
+          console.log(`Would consult ${agent}: ${result.summary}`);
+          break;
+        }
+
+        const cost = estimateCost(result.durationMs, result.costUsd, config.credits?.costPerSecondEstimate);
+        deductCredits(root, caller, cost, "consult", undefined, `Consultation with ${agent}`, config);
+
+        if (autoDecide) {
+          const decId = await addDecision(root, question, caller, agent, context);
+          await answerDecision(root, decId, result.summary, agent, {
+            rationale: `Direct autonomous consultation between ${caller} and ${agent}`,
+            creditsCost: cost,
+          });
+          console.log(`\n✅ Recorded and answered decision ${decId} in ledger.`);
+        }
+
+        console.log(`\n=== Consultation Response from ${agent} ===`);
+        console.log(result.summary);
+        console.log(`\n(Cost: $${cost.toFixed(3)} credits | Duration: ${result.durationMs}ms)`);
+        break;
+      }
+
+      case "credit": {
+        const sub = positionals[1];
+        const config = loadLeadConfig(root);
+        if (sub === "status" || sub === "list" || !sub) {
+          const state = loadCredits(root, config);
+          console.log("=== Coordo Agent Credits ===\n");
+          console.log(`Tracking: ${state.enabled ? "enabled" : "disabled"} | Limits Enforced: ${state.enforceLimits ? "yes" : "no"}\n`);
+          console.log("Agent".padEnd(16) + "Balance".padEnd(14) + "Spent".padEnd(14) + "Limit".padEnd(14) + "Status");
+          console.log("-".repeat(68));
+          let totalSpent = 0;
+          for (const [name, acc] of Object.entries(state.accounts)) {
+            totalSpent += acc.spent;
+            const status = acc.balance <= 0 ? "EXHAUSTED" : acc.balance < 5 ? "LOW" : "OK";
+            console.log(
+              name.padEnd(16) +
+              `$${acc.balance.toFixed(2)}`.padEnd(14) +
+              `$${acc.spent.toFixed(2)}`.padEnd(14) +
+              (acc.limit !== undefined ? `$${acc.limit.toFixed(2)}` : "unlimited").padEnd(14) +
+              status
+            );
+          }
+          console.log("-".repeat(68));
+          console.log(`Total Expended Across All Agents: $${totalSpent.toFixed(2)}`);
+        } else if (sub === "add") {
+          const target = positionals[2];
+          const amountStr = positionals[3];
+          if (!target || !amountStr) throw new Error("Usage: coordo credit add <agent|all> <amount> [--note <note>]");
+          const amount = Number(amountStr);
+          if (isNaN(amount) || amount <= 0) throw new Error("Amount must be a positive number.");
+          const note = flags.note as string | undefined;
+          const { balance } = addCredits(root, target, amount, note, config);
+          console.log(`✅ Added ${amount.toFixed(2)} credits to '${target}'. New balance: $${balance.toFixed(2)}`);
+        } else if (sub === "transfer") {
+          const from = positionals[2];
+          const to = positionals[3];
+          const amountStr = positionals[4];
+          if (!from || !to || !amountStr) throw new Error("Usage: coordo credit transfer <from> <to> <amount> [--note <note>]");
+          const amount = Number(amountStr);
+          if (isNaN(amount) || amount <= 0) throw new Error("Amount must be a positive number.");
+          const note = flags.note as string | undefined;
+          const res = transferCredits(root, from, to, amount, note, config);
+          if (!res.ok) throw new Error(res.error);
+          console.log(`✅ Transferred ${amount.toFixed(2)} credits from '${from}' ($${res.fromBalance.toFixed(2)}) to '${to}' ($${res.toBalance.toFixed(2)}).`);
+        } else if (sub === "history") {
+          const state = loadCredits(root, config);
+          const filterAgent = (flags.agent as string) || positionals[2];
+          let txs = state.transactions;
+          if (filterAgent) txs = txs.filter((t) => t.agent === filterAgent);
+          if (txs.length === 0) {
+            console.log("No credit transactions recorded.");
+          } else {
+            console.log(`=== Credit Transactions (${txs.length}) ===\n`);
+            for (const t of txs.slice(0, 30)) {
+              const sign = t.amount < 0 ? "+" : "-";
+              const amt = Math.abs(t.amount).toFixed(3);
+              const ref = t.refId ? ` [${t.refId}]` : "";
+              const note = t.note ? ` (${t.note})` : "";
+              console.log(`${t.id.padEnd(8)} ${t.timestamp.slice(0, 16)} ${t.agent.padEnd(12)} ${sign}$${amt.padEnd(8)} bal:$${t.balanceAfter.toFixed(2)}${ref}${note}`);
+            }
+          }
+        } else {
+          console.log("Unknown credit command. Supported: status, add, transfer, history");
+        }
+        break;
+      }
+
+      case "mongo": {
+        const sub = positionals[1];
+        if (sub === "migrate") {
+          const ledgerId = (flags["ledger-id"] as string) || "personal";
+          const result = await migrateMongo(root, ledgerId);
+          console.log(`✅ Migrated ${result.items} historical ledger items to Mongo ledger '${ledgerId}'.`);
+        } else if (sub === "sync") {
+          const ledgerId = (flags["ledger-id"] as string) || "personal";
+          const result = await syncMongo(root, ledgerId);
+          console.log(`✅ Added ${result.added} newer parsed ledger items to Mongo ledger '${ledgerId}' and refreshed its archive.${result.skipped ? ` Skipped ${result.skipped} stale archive copies of items Mongo already holds (Mongo is canonical).` : ""}`);
+        } else if (sub === "analytics") {
+          const ledgerId = (flags["ledger-id"] as string) || "personal";
+          console.log(JSON.stringify(await analyticsMongo(ledgerId), null, 2));
+        } else if (sub === "check") {
+          const ledgerId = (flags["ledger-id"] as string) || "personal";
+          const result = await checkMongo(ledgerId);
+          console.log(`✅ Mongo reachable; ping ${result.roundTripMs}ms (ledger '${result.ledgerId}').`);
+        } else if (sub === "ensure-indexes") {
+          const ledgerId = (flags["ledger-id"] as string) || "personal";
+          await ensureMongoIndexes(ledgerId);
+          console.log(`✅ Coordo indexes ensured for ledger '${ledgerId}'.`);
+        } else if (sub === "export") {
+          const ledger = await parseLedger(root);
+          const output = JSON.stringify(ledger, null, 2) + "\n";
+          const out = flags.out as string | undefined;
+          if (out) {
+            const { writeFileSync } = await import("node:fs");
+            const destination = path.resolve(out);
+            writeFileSync(destination, output, "utf-8");
+            console.log(`✅ Exported Mongo ledger to ${destination}.`);
+          } else {
+            process.stdout.write(output);
+          }
+        } else {
+          console.log("Unknown mongo command. Supported: migrate, sync, analytics, check, ensure-indexes, export");
+        }
+        break;
+      }
+
       case "plan": {
         const goal = positionals[1];
         const planFile = flags["plan-file"] as string | undefined;
@@ -329,11 +596,13 @@ async function main() {
         const plan = await makePlan(root, goal ?? `plan file ${planFile}`, config, planFile);
         plan.tasks.forEach((t, i) => console.log(`${i + 1}. [${t.agent}] ${t.title}\n   ${t.description.replace(/\n/g, "\n   ")}`));
         if (plan.question) console.log(`? ${plan.question}`);
+        if (plan.modelRoute) console.log(`planner model-router → ${plan.modelRoute.provider}/${plan.modelRoute.model} (${plan.modelRoute.tier}; ${plan.modelRoute.reasons.join("; ")})`);
+        else if (plan.modelRouteWarning) console.log(`planner model-router unavailable; using configured model: ${plan.modelRouteWarning}`);
         if (flags["dry-run"]) {
           console.log("\nDry run: nothing written to the ledger.");
           break;
         }
-        const ids = writePlan(root, goal ?? `plan file ${planFile}`, plan, "manual", config);
+        const ids = await writePlan(root, goal ?? `plan file ${planFile}`, plan, "manual", config);
         console.log(`\n✅ Wrote ${ids.join(", ")} to the ledger.`);
         break;
       }

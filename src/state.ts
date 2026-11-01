@@ -3,6 +3,8 @@ import path from "node:path";
 
 export interface CoordoState {
   checkpoints: Record<string, string>;
+  credits?: any;
+  decisions?: any;
 }
 
 function statePath(projectRoot: string): string {
@@ -14,14 +16,23 @@ export function readState(projectRoot: string): CoordoState {
   if (!existsSync(p)) return { checkpoints: {} };
   try {
     const parsed = JSON.parse(readFileSync(p, "utf-8"));
-    return { checkpoints: parsed.checkpoints ?? {} };
+    return {
+      checkpoints: parsed.checkpoints ?? {},
+      credits: parsed.credits,
+      decisions: parsed.decisions,
+    };
   } catch {
     return { checkpoints: {} };
   }
 }
 
 export function writeState(projectRoot: string, state: CoordoState): void {
-  writeFileSync(statePath(projectRoot), JSON.stringify(state, null, 2) + "\n", "utf-8");
+  const p = statePath(projectRoot);
+  const dir = path.dirname(p);
+  if (!existsSync(dir)) {
+    import("node:fs").then((fs) => fs.mkdirSync(dir, { recursive: true }));
+  }
+  writeFileSync(p, JSON.stringify(state, null, 2) + "\n", "utf-8");
 }
 
 export function getCheckpoint(projectRoot: string, as: string): string | undefined {

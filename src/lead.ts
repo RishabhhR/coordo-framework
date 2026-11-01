@@ -3,9 +3,11 @@ import path from "node:path";
 import { dispatch, isTaskDone, notify, runsDir, timestamp, type DispatchResult } from "./agents.js";
 import { commitAll, commitBlocker, uncommittedChanges, type GitError } from "./git.js";
 import { addTask, parseLedger, type LedgerItem } from "./ledger.js";
-import { isAgentAddress, type AgentName, type LeadConfig } from "./leadConfig.js";
+import { isAgentAddress, resolveProfile, type AgentName, type LeadConfig } from "./leadConfig.js";
 import { makePlan, writePlan } from "./planner.js";
-import { isVerifyTask, verifyTaskBody, workerPrompt, VERIFY_PREFIX } from "./prompts.js";
+import { routeModel, type ModelRouteDecision } from "./modelRouter.js";
+import { isVerifyTask, verifyTaskBody, workerPrompt, decisionWorkerPrompt, VERIFY_PREFIX } from "./prompts.js";
+import { checkCreditAvailable, deductCredits, estimateCost } from "./credits.js";
 
 // The coordo-lead loop. Each step re-reads the ledger, pauses if a human owes
 // a decision, otherwise dispatches the oldest open in-scope task to the agent
@@ -41,6 +43,9 @@ export interface StepRecord {
   logPath: string | null;
   summary: string;
   filed?: string;
+  model?: string;
+  tier?: ModelRouteDecision["tier"];
+  routeReasons?: string[];
 }
 
 export interface LeadResult {
@@ -66,9 +71,9 @@ function firstLine(item: LedgerItem): string {
   return line.length > 90 ? line.slice(0, 89) + "…" : line;
 }
 
-function closedSafely(root: string, taskId: string): boolean {
+async function closedSafely(root: string, taskId: string): Promise<boolean> {
   try {
-    return isTaskDone(root, taskId);
+    return await isTaskDone(root, taskId);
   } catch {
     return false;
   }
@@ -106,7 +111,7 @@ export async function runLead(root: string, config: LeadConfig, opts: LeadOption
   // In goal mode the run owns only what it creates: the planned tasks plus any
   // VERIFY/DEFECT tasks and decisions opened after it started. Without a goal
   // it drives every open task addressed to an enabled agent.
-  const initial = parseLedger(root);
+  const initial = await parseLedger(root);
   const everything = [...initial.decisionsNeeded, ...initial.tasks, ...initial.resolvedLog];
   const startTask = maxId(everything, "TASK");
   const startDec = maxId(everything, "DEC");
@@ -139,9 +144,14 @@ export async function runLead(root: string, config: LeadConfig, opts: LeadOption
     plan.tasks.forEach((t, i) => log(`  ${i + 1}. [${t.agent}] ${t.title}`));
     if (plan.question) log(`  ? ${plan.question}`);
     if (plan.costUsd !== undefined) log(`  (planner cost $${plan.costUsd.toFixed(2)})`);
+    if (plan.modelRoute) {
+      log(`  (planner model: ${plan.modelRoute.provider}/${plan.modelRoute.model}, ${plan.modelRoute.tier}: ${plan.modelRoute.reasons.join("; ")})`);
+    } else if (plan.modelRouteWarning) {
+      log(`  (planner model routing unavailable; using configured model: ${plan.modelRouteWarning})`);
+    }
     if (opts.dryRun) return finish("planned", "Dry run: nothing written to the ledger, no agents dispatched.");
 
-    planned = writePlan(root, opts.goal ?? `plan file ${opts.planFile}`, plan, runId, config);
+    planned = await writePlan(root, opts.goal ?? `plan file ${opts.planFile}`, plan, runId, config);
     log(`  Wrote ${planned.join(", ")} to the ledger.`);
     const sha = commit(`coordo-lead: plan ${planned.join(", ")} (run ${runId})\n\nGoal: ${opts.goal ?? opts.planFile}`);
     if (sha) log(`  Committed the plan as ${sha}.`);
@@ -156,7 +166,7 @@ export async function runLead(root: string, config: LeadConfig, opts: LeadOption
   let step = 0;
 
   while (true) {
-    const ledger = parseLedger(root);
+    const ledger = await parseLedger(root);
 
     const blocking = ledger.decisionsNeeded.filter((d) => !isAgentAddress(config, d.to) && decisionInScope(d));
     if (blocking.length > 0) {
@@ -169,28 +179,104 @@ export async function runLead(root: string, config: LeadConfig, opts: LeadOption
       continue;
     }
 
+    const agentDecisions = config.autonomousDecisions !== false
+      ? ledger.decisionsNeeded
+          .filter((d) => isAgentAddress(config, d.to) && decisionInScope(d))
+          .sort((a, b) => idNum(a.id) - idNum(b.id))
+      : [];
+
     const open = ledger.tasks
       .filter((t) => config.agents.includes(t.to) && taskInScope(t))
       .sort((a, b) => idNum(a.id) - idNum(b.id));
-    if (open.length === 0) {
-      return finish("complete", steps.length === 0 ? "Nothing to do: no open tasks for enabled agents in scope." : "All tasks in scope are closed.");
+
+    if (open.length === 0 && agentDecisions.length === 0) {
+      return finish("complete", steps.length === 0 ? "Nothing to do: no open tasks for enabled agents in scope." : "All tasks and decisions in scope are closed.");
     }
+    const runnableDecisions = agentDecisions.filter((d) => (attempts.get(d.id) ?? 0) < config.maxAttemptsPerTask);
     const runnable = open.filter((t) => (attempts.get(t.id) ?? 0) < config.maxAttemptsPerTask);
-    if (runnable.length === 0) {
-      return finish("stuck", `Every open task in scope has used its ${config.maxAttemptsPerTask} attempts: ${open.map((t) => t.id).join(", ")}. Check the logs in .coordo/runs/.`);
+    if (runnable.length === 0 && runnableDecisions.length === 0) {
+      const allOpen = [...agentDecisions.map((d) => d.id), ...open.map((t) => t.id)];
+      return finish("stuck", `Every open item in scope has used its ${config.maxAttemptsPerTask} attempts: ${allOpen.join(", ")}. Check the logs in .coordo/runs/.`);
     }
 
     if (opts.dryRun) {
       log("\nWould dispatch, in order (VERIFY/DEFECT follow-ups are created as work closes):");
+      for (const d of runnableDecisions) {
+        log(`  [DECISION] ${d.id} → ${d.to}: ${firstLine(d)}`);
+      }
       for (const t of runnable) {
-        const how = await dispatch(t.to, "", { root, config, taskId: t.id, dryRun: true });
-        log(`  ${t.id} → ${t.to}: ${firstLine(t)}\n      via ${how.summary}`);
+        const profile = resolveProfile(config, t.to);
+        const routing = config.modelRouter.enabled && !profile.model
+          ? await routeModel(isVerifyTask(t) ? `Review and verify ${firstLine(t)}` : firstLine(t), t.body, profile.adapter, config.modelRouter, {
+            retry: (attempts.get(t.id) ?? 0) > 0,
+            cwd: root,
+          })
+          : undefined;
+        const model = routing?.decision?.model;
+        const how = await dispatch(t.to, "", { root, config, taskId: t.id, dryRun: true, model });
+        const route = routing?.decision
+          ? `\n      routed ${routing.decision.provider}/${routing.decision.model} (${routing.decision.tier})`
+          : routing && "warning" in routing
+            ? `\n      routing fallback: ${routing.warning}`
+            : profile.model ? `\n      pinned model: ${profile.model}` : "";
+        log(`  ${t.id} → ${t.to}: ${firstLine(t)}${route}\n      via ${how.summary}`);
       }
       return finish("planned", "Dry run: no agents dispatched.");
     }
 
     if (step >= maxSteps) {
-      return finish("stuck", `Reached --max-steps ${maxSteps} with ${open.length} task(s) still open: ${open.map((t) => t.id).join(", ")}. Re-run to continue.`);
+      const remaining = [...agentDecisions.map((d) => d.id), ...open.map((t) => t.id)];
+      return finish("stuck", `Reached --max-steps ${maxSteps} with ${remaining.length} item(s) still open: ${remaining.join(", ")}. Re-run to continue.`);
+    }
+
+    // Process autonomous agent decisions before or alongside tasks
+    if (runnableDecisions.length > 0) {
+      step++;
+      const dec = runnableDecisions[0];
+      const agent: AgentName = dec.to;
+      const attempt = (attempts.get(dec.id) ?? 0) + 1;
+      attempts.set(dec.id, attempt);
+      log(`\n▶ step ${step}/${maxSteps}  ${dec.id} → ${agent}  (attempt ${attempt}/${config.maxAttemptsPerTask})  ${firstLine(dec)}`);
+
+      if (config.credits?.enabled && config.credits?.enforceLimits) {
+        const creditCheck = checkCreditAvailable(root, agent, 0.001, config);
+        if (!creditCheck.ok) {
+          notify(`coordo lead: agent ${agent} out of credits for ${dec.id}`);
+          return finish("paused", `Agent ${agent} has exhausted its credit balance (${creditCheck.balance.toFixed(2)} remaining). Add credits with: coordo credit add ${agent} <amount>`);
+        }
+      }
+
+      const prompt = decisionWorkerPrompt(dec, agent, root, config);
+      const result = await dispatch(agent, prompt, { root, config, taskId: dec.id, log });
+      const after = await parseLedger(root);
+      const closed = !after.decisionsNeeded.some((d) => d.id === dec.id);
+      const cost = estimateCost(result.durationMs, result.costUsd, config.credits?.costPerSecondEstimate);
+      deductCredits(root, agent, cost, "decision", dec.id, `Decided ${dec.id}`, config);
+
+      if (closed) {
+        log(`  ✓ ${dec.id} resolved by ${agent} (${formatDuration(result.durationMs)}, $${cost.toFixed(2)})`);
+        try {
+          const sha = commit(`${dec.id}: ${firstLine(dec)}\n\nDecision resolved by ${agent}; committed by coordo-lead (run ${runId}).`);
+          if (sha) log(`    committed ${sha}`);
+        } catch (err) {
+          steps.push({
+            step, taskId: dec.id, agent, attempt, mode: result.mode, exitOk: result.ok, closed,
+            durationMs: result.durationMs, costUsd: cost, logPath: result.logPath, summary: result.summary,
+          });
+          return finish("stuck", `${dec.id} resolved, but committing changes failed: ${(err as GitError).reason ?? (err as Error).message}`);
+        }
+      } else {
+        lastFailure.set(dec.id, result.summary);
+        log(`  ✗ ${dec.id} still open after ${agent} ${result.ok ? "finished" : "failed"} (${formatDuration(result.durationMs)}, $${cost.toFixed(2)}): ${result.summary.split("\n")[0].slice(0, 200)}`);
+      }
+      if (result.logPath) log(`    log: ${path.relative(root, result.logPath)}`);
+
+      steps.push({
+        step, taskId: dec.id, agent, attempt, mode: result.mode, exitOk: result.ok, closed,
+        durationMs: result.durationMs, costUsd: cost, logPath: result.logPath, summary: result.summary,
+      });
+
+      continue;
     }
 
     step++;
@@ -200,44 +286,72 @@ export async function runLead(root: string, config: LeadConfig, opts: LeadOption
     attempts.set(task.id, attempt);
     log(`\n▶ step ${step}/${maxSteps}  ${task.id} → ${agent}  (attempt ${attempt}/${config.maxAttemptsPerTask})  ${firstLine(task)}`);
 
+    if (config.credits?.enabled && config.credits?.enforceLimits) {
+      const creditCheck = checkCreditAvailable(root, agent, 0.001, config);
+      if (!creditCheck.ok) {
+        notify(`coordo lead: agent ${agent} out of credits for ${task.id}`);
+        return finish("paused", `Agent ${agent} has exhausted its credit balance (${creditCheck.balance.toFixed(2)} remaining). Add credits with: coordo credit add ${agent} <amount>`);
+      }
+    }
+
+    const profile = resolveProfile(config, agent);
+    const routing = config.modelRouter.enabled && !profile.model
+      ? await routeModel(isVerifyTask(task) ? `Review and verify ${firstLine(task)}` : firstLine(task), task.body, profile.adapter, config.modelRouter, {
+        retry: attempt > 1,
+        cwd: root,
+      })
+      : undefined;
+    const selectedModel = routing?.decision?.model;
+    if (routing?.decision) {
+      log(`  model-router → ${routing.decision.provider}/${routing.decision.model} (${routing.decision.tier}; ${routing.decision.reasons.join("; ")})`);
+    } else if (routing && "warning" in routing) {
+      log(`  model-router unavailable; using configured model for ${agent}: ${routing.warning}`);
+    } else if (profile.model) {
+      log(`  model pinned by ${agent} profile: ${profile.model}`);
+    }
+
     let prompt = workerPrompt(task, agent, root, config);
     const previous = lastFailure.get(task.id);
     if (previous) prompt += `\n\nA previous attempt ended without closing ${task.id}. Its last message was:\n<<<\n${previous}\n>>>`;
 
-    const result = await dispatch(agent, prompt, { root, config, taskId: task.id, log });
-    const closed = closedSafely(root, task.id);
-    const cost = result.costUsd !== undefined ? `, $${result.costUsd.toFixed(2)}` : "";
+    const result = await dispatch(agent, prompt, { root, config, taskId: task.id, model: selectedModel, log });
+    const closed = await closedSafely(root, task.id);
+    const cost = estimateCost(result.durationMs, result.costUsd, config.credits?.costPerSecondEstimate);
+    deductCredits(root, agent, cost, "task", task.id, `Work on ${task.id}`, config);
+    const costStr = `, $${cost.toFixed(2)}`;
     if (closed) {
-      log(`  ✓ ${task.id} closed by ${agent} (${formatDuration(result.durationMs)}${cost})`);
+      log(`  ✓ ${task.id} closed by ${agent} (${formatDuration(result.durationMs)}${costStr})`);
       try {
         const sha = commit(`${task.id}: ${firstLine(task)}\n\nWork by ${agent}; committed by coordo-lead (run ${runId}).`);
         if (sha) log(`    committed ${sha}`);
       } catch (err) {
         steps.push({
           step, taskId: task.id, agent, attempt, mode: result.mode, exitOk: result.ok, closed,
-          durationMs: result.durationMs, costUsd: result.costUsd, logPath: result.logPath, summary: result.summary,
+          durationMs: result.durationMs, costUsd: cost, logPath: result.logPath, summary: result.summary,
+          model: routing?.decision?.model ?? profile.model ?? undefined, tier: routing?.decision?.tier, routeReasons: routing?.decision?.reasons,
         });
         return finish("stuck", `${task.id} closed, but committing its changes failed: ${(err as GitError).reason ?? (err as Error).message}\nThe changes are left in the working tree; fix the problem and commit them, then re-run.`);
       }
     } else {
       lastFailure.set(task.id, result.summary);
-      log(`  ✗ ${task.id} still open after ${agent} ${result.ok ? "finished" : "failed"} (${formatDuration(result.durationMs)}${cost}): ${result.summary.split("\n")[0].slice(0, 200)}`);
+      log(`  ✗ ${task.id} still open after ${agent} ${result.ok ? "finished" : "failed"} (${formatDuration(result.durationMs)}${costStr}): ${result.summary.split("\n")[0].slice(0, 200)}`);
     }
     if (result.logPath) log(`    log: ${path.relative(root, result.logPath)}`);
 
     let filed: string | undefined;
     if (closed && config.verifier && agent !== config.verifier && !isVerifyTask(task)) {
-      const after = parseLedger(root);
+      const after = await parseLedger(root);
       const alreadyFiled = [...after.tasks, ...after.resolvedLog].some((t) => t.body.startsWith(`${VERIFY_PREFIX}${task.id} `));
       if (!alreadyFiled) {
-        filed = addTask(root, verifyTaskBody(task, config.verifier, config), "lead", config.verifier);
+        filed = await addTask(root, verifyTaskBody(task, config.verifier, config), "lead", config.verifier);
         log(`  ↳ filed ${filed}: ${VERIFY_PREFIX}${task.id} → ${config.verifier}`);
       }
     }
 
     steps.push({
       step, taskId: task.id, agent, attempt, mode: result.mode, exitOk: result.ok, closed,
-      durationMs: result.durationMs, costUsd: result.costUsd, logPath: result.logPath, summary: result.summary, filed,
+      durationMs: result.durationMs, costUsd: cost, logPath: result.logPath, summary: result.summary, filed,
+      model: routing?.decision?.model ?? profile.model ?? undefined, tier: routing?.decision?.tier, routeReasons: routing?.decision?.reasons,
     });
   }
 }

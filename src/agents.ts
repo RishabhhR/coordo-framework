@@ -1,5 +1,5 @@
 import { execFileSync, spawn } from "node:child_process";
-import { createWriteStream, existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { createWriteStream, existsSync, mkdirSync, readFileSync, writeFileSync, accessSync, constants, statSync } from "node:fs";
 import { homedir } from "node:os";
 import path from "node:path";
 import { parseLedger } from "./ledger.js";
@@ -40,10 +40,18 @@ export interface DispatchOptions {
   /** Ledger task the prompt is about; lets handoff/async modes wait for it to close. */
   taskId?: string;
   dryRun?: boolean;
+  /** Per-task model selected by the local model-router bridge, if enabled. */
+  model?: string | null;
   log?: (line: string) => void;
 }
 
-const CODEX_APP_BIN = "/Applications/ChatGPT.app/Contents/Resources/codex";
+// Where ChatGPT.app has shipped its bundled Codex CLI, newest layout first. The app moves it between
+// releases (Resources/codex until the 2026-10-03 update, Resources/codex-cli/bin/codex after), so probe
+// every known place instead of trusting one hard-coded path.
+export const CODEX_APP_CANDIDATES: readonly string[] = ["/Applications", path.join(homedir(), "Applications")].flatMap((root) => [
+  path.join(root, "ChatGPT.app", "Contents", "Resources", "codex-cli", "bin", "codex"),
+  path.join(root, "ChatGPT.app", "Contents", "Resources", "codex"),
+]);
 const AGENTAPI_BIN = path.join(homedir(), ".gemini", "antigravity", "bin", "agentapi");
 const SUMMARY_CHARS = 600;
 
@@ -74,8 +82,17 @@ function onPath(name: string): string | null {
   return null;
 }
 
-export function resolveCodexBin(profile: Pick<ResolvedProfile, "bin">): string | null {
-  return profile.bin ?? onPath("codex") ?? (existsSync(CODEX_APP_BIN) ? CODEX_APP_BIN : null);
+function isExecutableFile(file: string): boolean {
+  try { accessSync(file, constants.X_OK); return statSync(file).isFile(); } catch { return false; }
+}
+
+export function resolveCodexBin(profile: Pick<ResolvedProfile, "bin">, candidates: readonly string[] = CODEX_APP_CANDIDATES): string | null {
+  return profile.bin ?? onPath("codex") ?? candidates.find(isExecutableFile) ?? null;
+}
+
+// Shown whenever Codex work falls back to a human handoff, so the cause is visible instead of silent.
+export function codexNotFoundHint(candidates: readonly string[] = CODEX_APP_CANDIDATES): string {
+  return `codex: no CLI found on PATH or in ChatGPT.app (looked at ${candidates.join(", ")}). Set {"codex": {"bin": "/full/path/to/codex"}} in .coordo/lead.json to point at it.`;
 }
 
 // agentapi talks to the Antigravity language server whose address Antigravity
@@ -87,10 +104,10 @@ export function resolveAgentapiBin(profile: Pick<ResolvedProfile, "bin">): strin
   return onPath("agentapi") ?? (existsSync(AGENTAPI_BIN) ? AGENTAPI_BIN : null);
 }
 
-export function claudeCommand(config: LeadConfig, prompt: string, opts: { planner?: boolean; profile?: ResolvedProfile } = {}): AgentCommand {
+export function claudeCommand(config: LeadConfig, prompt: string, opts: { planner?: boolean; profile?: ResolvedProfile; model?: string | null } = {}): AgentCommand {
   const profile = opts.profile ?? resolveProfile(config, "claude");
   const args = ["-p", "--output-format", "json"];
-  const model = opts.planner ? config.claude.plannerModel : profile.model;
+  const model = opts.model ?? (opts.planner ? config.claude.plannerModel : profile.model);
   if (model) args.push("--model", model);
   if (opts.planner) {
     args.push("--allowedTools", ...PLANNER_TOOLS);
@@ -104,19 +121,20 @@ export function claudeCommand(config: LeadConfig, prompt: string, opts: { planne
   return { bin: opts.planner ? config.claude.bin : (profile.bin ?? config.claude.bin), args, stdin: prompt };
 }
 
-export function codexCommand(profile: ResolvedProfile, root: string, prompt: string, lastMessageFile: string): AgentCommand | null {
+export function codexCommand(profile: ResolvedProfile, root: string, prompt: string, lastMessageFile: string, model?: string | null): AgentCommand | null {
   const bin = resolveCodexBin(profile);
   if (!bin) return null;
   const args = ["exec", "--cd", root, "--sandbox", profile.sandbox, "--color", "never", "-o", lastMessageFile];
-  if (profile.model) args.push("-m", profile.model);
+  const selectedModel = model ?? profile.model;
+  if (selectedModel) args.push("-m", selectedModel);
   args.push("-"); // read the prompt from stdin
   return { bin, args, stdin: prompt };
 }
 
-export function antigravityCommand(profile: ResolvedProfile, prompt: string, title: string): AgentCommand | null {
+export function antigravityCommand(profile: ResolvedProfile, prompt: string, title: string, model?: string | null): AgentCommand | null {
   const bin = resolveAgentapiBin(profile);
   if (!bin) return null;
-  return { bin, args: ["new-conversation", `--model=${profile.model ?? "flash"}`, `--title=${title}`, prompt] };
+  return { bin, args: ["new-conversation", `--model=${model ?? profile.model ?? "flash"}`, `--title=${title}`, prompt] };
 }
 
 // Any other CLI. {prompt}, {promptFile} and {root} are substituted into args;
@@ -189,9 +207,9 @@ export function parseClaudeOutput(stdout: string): { summary: string; costUsd?: 
   }
 }
 
-export function isTaskDone(root: string, taskId: string): boolean {
-  const ledger = parseLedger(root);
-  return !ledger.tasks.some((t) => t.id === taskId)
+export async function isTaskDone(root: string, taskId: string): Promise<boolean> {
+  const ledger = await parseLedger(root);
+  return !ledger.tasks.some((t) => t.id === taskId && t.status === "open")
     && ledger.resolvedLog.some((t) => t.id === taskId && t.status === "done");
 }
 
@@ -201,7 +219,7 @@ async function waitForTaskDone(root: string, taskId: string, pollMs: number, tim
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
     try {
-      if (isTaskDone(root, taskId)) return true;
+      if (await isTaskDone(root, taskId)) return true;
     } catch { /* ledger mid-write or mid-merge; look again next poll */ }
     await sleep(pollMs);
   }
@@ -222,6 +240,7 @@ export function notify(message: string): void {
 export async function dispatch(agent: AgentName, prompt: string, opts: DispatchOptions): Promise<DispatchResult> {
   const { root, config, taskId } = opts;
   const profile = resolveProfile(config, agent);
+  const model = opts.model ?? profile.model;
   const log = opts.log ?? ((line: string) => console.log(line));
   const started = Date.now();
   const label = `${timestamp()}-${agent}${taskId ? `-${taskId}` : ""}`;
@@ -233,9 +252,9 @@ export async function dispatch(agent: AgentName, prompt: string, opts: DispatchO
   const promptFile = path.join(root, ".coordo", "runs", `${label}.prompt.md`);
   let cmd: AgentCommand | null;
   switch (profile.adapter) {
-    case "claude": cmd = claudeCommand(config, prompt, { profile }); break;
-    case "codex": cmd = codexCommand(profile, root, prompt, lastMessageFile); break;
-    case "antigravity": cmd = antigravityCommand(profile, prompt, `coordo ${taskId ?? "dispatch"}`); break;
+    case "claude": cmd = claudeCommand(config, prompt, { profile, model }); break;
+    case "codex": cmd = codexCommand(profile, root, prompt, lastMessageFile, model); break;
+    case "antigravity": cmd = antigravityCommand(profile, prompt, `coordo ${taskId ?? "dispatch"}`, model); break;
     case "command": cmd = customCommand(profile, root, prompt, promptFile); break;
     case "handoff": cmd = null; break;
   }
@@ -244,8 +263,8 @@ export async function dispatch(agent: AgentName, prompt: string, opts: DispatchO
     // agentapi carries the whole prompt as its last argument; don't print it.
     const shown = cmd ? cmd.args.slice(0, profile.adapter === "antigravity" ? -1 : undefined) : [];
     const how = cmd
-      ? `${cmd.bin} ${shown.join(" ")}`.slice(0, 300) + ` [${profile.adapter}${profile.model ? `, ${profile.model}` : ""}]`
-      : "handoff (no headless CLI available)";
+      ? `${cmd.bin} ${shown.join(" ")}`.slice(0, 300) + ` [${profile.adapter}${model ? `, ${model}` : ""}]`
+      : `handoff (no headless CLI available)${profile.adapter === "codex" ? `; ${codexNotFoundHint()}` : ""}`;
     return { agent, mode: "dry-run", ok: true, exitCode: null, summary: how, logPath: null, durationMs: 0 };
   }
 
@@ -257,6 +276,7 @@ export async function dispatch(agent: AgentName, prompt: string, opts: DispatchO
     writeFileSync(promptFile, prompt);
     notify(`${taskId ?? "A prompt"} needs ${agent}: paste ${path.basename(promptFile)} into ${agent}`);
     log(`  ✋ ${agent} has no headless CLI here. Paste this prompt into ${agent}:\n     ${promptFile}`);
+    if (profile.adapter === "codex") log(`     ${codexNotFoundHint()}`);
     if (!taskId) {
       return { agent, mode: "handoff", ok: true, exitCode: null, summary: `prompt written to ${promptFile}`, logPath: null, durationMs: elapsed() };
     }

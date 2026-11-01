@@ -61,6 +61,13 @@ export interface ResolvedProfile {
   sandbox: "read-only" | "workspace-write";
 }
 
+export interface CreditsConfig {
+  enabled: boolean;
+  defaultBalance: number;
+  enforceLimits: boolean;
+  costPerSecondEstimate: number;
+}
+
 export interface LeadConfig {
   /** Names of the agents the lead may dispatch to; tasks addressed to anyone else are left alone. */
   agents: AgentName[];
@@ -83,6 +90,12 @@ export interface LeadConfig {
   runTimeoutMinutes: number;
   /** How often to re-read the ledger while waiting on a handoff or an asynchronous agent. */
   pollSeconds: number;
+  /** Local model-router bridge settings. Routing only recommends a model; adapters still own execution. */
+  modelRouter: {
+    enabled: boolean;
+    bin: string;
+    timeoutSeconds: number;
+  };
   /** Default role per agent name (profiles override it); shown to the planner. */
   roles: Record<AgentName, string>;
   /** Defaults shared by every agent that uses the claude adapter. */
@@ -105,10 +118,13 @@ export interface LeadConfig {
   antigravity: {
     /** null = `agentapi`, used only when ANTIGRAVITY_LS_ADDRESS is set (an Antigravity terminal). */
     bin: string | null;
-    model: "flash_lite" | "flash" | "pro";
+    model: string | null;
     /** Kept for old configs; prefer the top-level `pollSeconds`. */
     pollSeconds: number;
   };
+  credits: CreditsConfig;
+  /** When true, agent-addressed decisions are resolved autonomously by target agents in coordo lead. Default true. */
+  autonomousDecisions: boolean;
 }
 
 export const DEFAULT_LEAD_CONFIG: LeadConfig = {
@@ -123,11 +139,23 @@ export const DEFAULT_LEAD_CONFIG: LeadConfig = {
   maxPlannedTasks: 6,
   runTimeoutMinutes: 45,
   pollSeconds: 15,
+  modelRouter: {
+    enabled: true,
+    bin: "model-router",
+    timeoutSeconds: 5,
+  },
   roles: {
     codex: "architecture, schemas, types, interfaces and low-level modules",
     antigravity: "feature implementation, UI and integration code",
     claude: "tests, verification, code review and git hygiene",
   },
+  credits: {
+    enabled: true,
+    defaultBalance: 100.0,
+    enforceLimits: false,
+    costPerSecondEstimate: 0.0005,
+  },
+  autonomousDecisions: true,
   claude: {
     bin: "claude",
     model: null,
@@ -149,7 +177,7 @@ export const DEFAULT_LEAD_CONFIG: LeadConfig = {
   },
   antigravity: {
     bin: null,
-    model: "flash",
+    model: null,
     pollSeconds: 15,
   },
 };
@@ -252,7 +280,19 @@ export function loadLeadConfig(projectRoot: string): LeadConfig {
     claude: { ...config.claude, ...rest.claude },
     codex: { ...config.codex, ...rest.codex },
     antigravity: { ...config.antigravity, ...rest.antigravity },
+    modelRouter: { ...config.modelRouter, ...rest.modelRouter },
+    credits: { ...config.credits, ...rest.credits },
+    autonomousDecisions: rest.autonomousDecisions ?? config.autonomousDecisions,
   };
+  if (typeof merged.modelRouter.enabled !== "boolean") {
+    fail(file, `"modelRouter.enabled" must be true or false.`);
+  }
+  if (typeof merged.modelRouter.bin !== "string" || !merged.modelRouter.bin.trim()) {
+    fail(file, `"modelRouter.bin" must be a non-empty executable name or path.`);
+  }
+  if (!Number.isInteger(merged.modelRouter.timeoutSeconds) || merged.modelRouter.timeoutSeconds < 1 || merged.modelRouter.timeoutSeconds > 60) {
+    fail(file, `"modelRouter.timeoutSeconds" must be an integer from 1 to 60.`);
+  }
   if (rawAgents !== undefined) {
     const { names, profiles } = normalizeAgents(file, rawAgents);
     merged.agents = names;

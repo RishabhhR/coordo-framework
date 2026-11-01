@@ -26,22 +26,22 @@ function buildSnippet(agentName: string | null): string {
   const as = agentName ?? "<your-agent-name>";
   return `${SNIPPET_MARKER_START}
 ## Multi-Agent Coordination (coordo)
-Several AI agents work on this project, in different tools or as different roles inside one tool. They coordinate through a shared ledger at \`.coordo/ledger.md\`. ${identity}
+Several AI agents work on this project, in different tools or as different roles inside one tool. They coordinate through Coordo. ${identity}
 
 At the start of a session:
-1. Run \`coordo status\` — leads with any open decisions blocking work.
+1. Run \`coordo status --as ${as}\` — leads with any open decisions blocking work.
 2. Run \`coordo digest --as ${as}\` — shows what changed since you last checked.
 
-Read or edit \`.coordo/ledger.md\` directly, or use \`coordo task\` / \`coordo decision\`.
+If \`.coordo/config.json\` says \`\"backend\": \"mongo\"\`, Mongo is the canonical private ledger. Do not edit \`.coordo/ledger.md\` directly or commit coordination entries; it is a read-only migration archive. Use the CLI with your explicit identity (\`--as\` / \`--from\`) for all task and decision writes. Never print, log, commit, paste, or deploy Mongo credentials. If Mongo is unavailable, stop and report the blocker rather than falling back to local ledger writes. In Git-backed projects without that config, use \`coordo task\` / \`coordo decision\` as usual.
 
 **Development protocol (ledger-first, always):**
 1. **Before writing any code**, add a \`coordo task\` describing the piece you intend to build, which files it touches, and your approach — after first checking it is actually doable (read the relevant code). If \`coordo status\` shows another agent already claimed an overlapping task, pick something else or raise a \`coordo decision\` instead of duplicating.
-2. Commit the ledger claim to git **before** starting the code change, so the other agents see it even mid-flight.
+2. In Git-backed mode, commit the ledger claim to git **before** starting the code change. In Mongo mode, the CLI write is the claim; do not edit or commit the archive.
 3. Do the work; commit the code referencing the task id (e.g. "TASK-007: ...").
 4. Mark it \`coordo task done <id> --note "..."\` with what changed, which files, and how it was verified.
 5. **Review other agents' completed work**: when \`coordo digest --as ${as}\` shows their commits, read the diff, and record the review outcome as a note or a new task/decision if you find problems. Don't silently rewrite their code — raise a decision first.
 
-Before ending a session (or after a handoff-worthy change), run \`coordo checkpoint --as ${as}\`.
+Before ending a session (or after a handoff-worthy change), run \`coordo checkpoint --as ${as}\`. Checkpoints and \`digest\` remain Git history metadata; task and decision state comes from the configured backend.
 ${SNIPPET_MARKER_END}`;
 }
 
