@@ -155,8 +155,8 @@ test("the command adapter runs any CLI, passing the prompt by file or by stdin",
 test("the handoff adapter writes the prompt for a human to relay instead of running anything", () => {
   const dir = project({ agents: { tutor: { adapter: "handoff", role: "explains" } }, verifier: null });
   const { status, output } = run(dir, ["dispatch", "tutor", "Explain the module."]);
-  assert.equal(status, 0, output);
-  assert.match(output, /tutor \(handoff\) finished/);
+  assert.equal(status, 3, output); // handed over, no result yet
+  assert.match(output, /tutor \(handoff\) pending/);
   assert.match(output, /prompt written to .*\.prompt\.md/);
   assert.deepEqual(calls(dir), []);
 });

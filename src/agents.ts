@@ -20,11 +20,19 @@ export interface AgentCommand {
   stdin?: string;
 }
 
+/**
+ * What actually came of a dispatch. Callers must not treat anything but "answered" as a result:
+ * answered = an agent ran and finished (or closed the task); pending = the work was handed over and no
+ * result exists yet; failed = the agent errored or timed out; dry-run = nothing ran.
+ */
+export type DispatchOutcome = "answered" | "pending" | "failed" | "dry-run";
+
 export interface DispatchResult {
   agent: AgentName;
   /** headless = ran the agent's CLI; handoff = a human relays the prompt; dry-run = nothing ran. */
   mode: "headless" | "handoff" | "dry-run";
-  /** Headless: the process exited 0. Handoff: the task was closed before the timeout. */
+  outcome: DispatchOutcome;
+  /** True only when there is a result: outcome is "answered" (or "dry-run", where there is nothing to fail). */
   ok: boolean;
   exitCode: number | null;
   /** The agent's final message (or the reason it failed), trimmed. */
@@ -247,6 +255,7 @@ export async function dispatch(agent: AgentName, prompt: string, opts: DispatchO
   const timeoutMs = config.runTimeoutMinutes * 60_000;
   const pollMs = config.pollSeconds * 1000;
   const elapsed = () => Date.now() - started;
+  const finished = (ok: boolean) => ({ ok, outcome: ok ? "answered" as const : "failed" as const });
 
   const lastMessageFile = path.join(root, ".coordo", "runs", `${label}.last-message.txt`);
   const promptFile = path.join(root, ".coordo", "runs", `${label}.prompt.md`);
@@ -265,7 +274,7 @@ export async function dispatch(agent: AgentName, prompt: string, opts: DispatchO
     const how = cmd
       ? `${cmd.bin} ${shown.join(" ")}`.slice(0, 300) + ` [${profile.adapter}${model ? `, ${model}` : ""}]`
       : `handoff (no headless CLI available)${profile.adapter === "codex" ? `; ${codexNotFoundHint()}` : ""}`;
-    return { agent, mode: "dry-run", ok: true, exitCode: null, summary: how, logPath: null, durationMs: 0 };
+    return { agent, mode: "dry-run", outcome: "dry-run", ok: true, exitCode: null, summary: how, logPath: null, durationMs: 0 };
   }
 
   const dir = runsDir(root);
@@ -278,12 +287,12 @@ export async function dispatch(agent: AgentName, prompt: string, opts: DispatchO
     log(`  ✋ ${agent} has no headless CLI here. Paste this prompt into ${agent}:\n     ${promptFile}`);
     if (profile.adapter === "codex") log(`     ${codexNotFoundHint()}`);
     if (!taskId) {
-      return { agent, mode: "handoff", ok: true, exitCode: null, summary: `prompt written to ${promptFile}`, logPath: null, durationMs: elapsed() };
+      return { agent, mode: "handoff", outcome: "pending", ok: false, exitCode: null, summary: `prompt written to ${promptFile}`, logPath: null, durationMs: elapsed() };
     }
     log(`     Waiting up to ${config.runTimeoutMinutes}m for ${taskId} to be marked done (Ctrl-C to stop)...`);
     const done = await waitForTaskDone(root, taskId, pollMs, timeoutMs);
     return {
-      agent, mode: "handoff", ok: done, exitCode: null, logPath: null, durationMs: elapsed(),
+      agent, mode: "handoff", outcome: done ? "answered" : "failed", ok: done, exitCode: null, logPath: null, durationMs: elapsed(),
       summary: done ? `${taskId} closed on the ledger` : `timed out waiting for ${taskId}`,
     };
   }
@@ -292,28 +301,29 @@ export async function dispatch(agent: AgentName, prompt: string, opts: DispatchO
   const result = await runProcess(cmd, root, logPath, timeoutMs);
   const base = { agent, mode: "headless" as const, exitCode: result.exitCode, logPath };
   if (result.error || result.timedOut) {
-    return { ...base, ok: false, durationMs: elapsed(), summary: result.error ?? `timed out after ${config.runTimeoutMinutes}m` };
+    return { ...base, ...finished(false), durationMs: elapsed(), summary: result.error ?? `timed out after ${config.runTimeoutMinutes}m` };
   }
 
   if (profile.adapter === "claude") {
     const out = parseClaudeOutput(result.stdout);
-    return { ...base, ok: result.exitCode === 0 && !out.isError, summary: trimSummary(out.summary), costUsd: out.costUsd, durationMs: elapsed() };
+    return { ...base, ...finished(result.exitCode === 0 && !out.isError), summary: trimSummary(out.summary), costUsd: out.costUsd, durationMs: elapsed() };
   }
   if (profile.adapter === "codex") {
     const last = existsSync(lastMessageFile) ? readFileSync(lastMessageFile, "utf-8") : result.stdout;
-    return { ...base, ok: result.exitCode === 0, summary: trimSummary(last), durationMs: elapsed() };
+    return { ...base, ...finished(result.exitCode === 0), summary: trimSummary(last), durationMs: elapsed() };
   }
   if (profile.adapter === "command") {
-    return { ...base, ok: result.exitCode === 0, summary: trimSummary(result.stdout), durationMs: elapsed() };
+    return { ...base, ...finished(result.exitCode === 0), summary: trimSummary(result.stdout), durationMs: elapsed() };
   }
 
   // antigravity: agentapi only starts the conversation; the work happens
   // asynchronously, so completion is the task closing on the ledger.
   if (result.exitCode !== 0 || /"error"/.test(result.stdout)) {
-    return { ...base, ok: false, summary: trimSummary(result.stdout), durationMs: elapsed() };
+    return { ...base, ...finished(false), summary: trimSummary(result.stdout), durationMs: elapsed() };
   }
-  if (!taskId) return { ...base, ok: true, summary: trimSummary(result.stdout), durationMs: elapsed() };
+  // Starting a conversation is not an answer: with no task to watch, the result is still to come.
+  if (!taskId) return { ...base, outcome: "pending", ok: false, summary: `conversation started, no result yet: ${trimSummary(result.stdout)}`, durationMs: elapsed() };
   log(`     Antigravity conversation started; waiting for ${taskId} to be marked done...`);
   const done = await waitForTaskDone(root, taskId, pollMs, timeoutMs);
-  return { ...base, ok: done, summary: done ? `${taskId} closed on the ledger` : `timed out waiting for ${taskId}`, durationMs: elapsed() };
+  return { ...base, ...finished(done), summary: done ? `${taskId} closed on the ledger` : `timed out waiting for ${taskId}`, durationMs: elapsed() };
 }

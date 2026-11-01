@@ -258,8 +258,10 @@ test("a planner question becomes a human decision and pauses the run", () => {
 test("dispatch hands off to a human when an agent has no headless CLI", () => {
   const dir = project({ config: { antigravity: { bin: null } } });
   const { status, output } = runCli(dir, ["dispatch", "antigravity", "Refactor the router"]);
-  assert.equal(status, 0, output);
+  assert.equal(status, 3, output); // handed over, no result yet
   assert.match(output, /no headless CLI here/);
+  assert.match(output, /pending/);
+  assert.doesNotMatch(output, /finished/);
   const prompts = readdirSync(path.join(dir, ".coordo", "runs")).filter((f) => f.endsWith(".prompt.md"));
   assert.equal(prompts.length, 1);
   assert.match(readFileSync(path.join(dir, ".coordo", "runs", prompts[0]), "utf-8"), /Refactor the router/);

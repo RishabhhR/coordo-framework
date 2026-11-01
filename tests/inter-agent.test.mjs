@@ -24,6 +24,17 @@ const finish = (message) => {
   process.exit(0);
 };
 
+if (process.env.FAKE_AGENT_CRASH) {
+  console.error("fatal: model quota exhausted");
+  console.log("fatal: model quota exhausted");
+  process.exit(1);
+}
+if (process.env.FAKE_AGENT_IS_ERROR) {
+  console.log(JSON.stringify({ type: "result", is_error: true, result: "API error: overloaded", total_cost_usd: 0.01 }));
+  process.exit(0);
+}
+if (process.env.FAKE_AGENT_BLANK) finish("   ");
+
 if (prompt.includes("QUESTION FROM")) {
   finish("Autonomous consultation: recommend option A due to modularity.");
 }
@@ -142,4 +153,110 @@ test("coordo lead pauses if credit limit is exhausted with enforceLimits", () =>
   const res = runCli(dir, ["lead"]);
   assert.equal(res.status, 3, res.output); // exit code 3 is paused
   assert.match(res.output, /exhausted its credit balance/);
+});
+
+// ---- A peer call only counts as an answer if an agent actually produced one (TASK-057). ----
+const NO_CONNECTOR = { ANTIGRAVITY_LS_ADDRESS: undefined, COORDO_NO_NOTIFY: "1" };
+const unconnected = () => project({ antigravity: { bin: null } }).dir;
+const decisions = (dir) => runCli(dir, ["decision", "list", "--status", "all"]).output;
+const spent = (dir) => runCli(dir, ["credit", "status"]).output;
+
+test("invoke with no connector reports pending, not success, and charges nothing", () => {
+  const dir = unconnected();
+  const before = spent(dir);
+  const res = runCli(dir, ["invoke", "antigravity", "audit-only probe", "--from", "codex"], NO_CONNECTOR);
+  assert.equal(res.status, 3, res.output);
+  assert.match(res.output, /pending/);
+  assert.doesNotMatch(res.output, /finished|✅/);
+  assert.equal(spent(dir), before);
+});
+
+test("consult --auto-decide with no connector records no decision", () => {
+  const dir = unconnected();
+  const res = runCli(dir, ["consult", "antigravity", "audit-only question", "--from", "codex", "--auto-decide"], NO_CONNECTOR);
+  assert.equal(res.status, 3, res.output);
+  assert.match(res.output, /has not answered/);
+  assert.match(res.output, /No decision was recorded/);
+  assert.doesNotMatch(res.output, /Recorded and answered|Consultation Response/);
+  assert.doesNotMatch(decisions(dir), /DEC-001/);
+  assert.doesNotMatch(readFileSync(path.join(dir, ".coordo", "ledger.md"), "utf-8"), /prompt written to/);
+});
+
+test("consult without --auto-decide and no connector also reports pending", () => {
+  const dir = unconnected();
+  const res = runCli(dir, ["consult", "antigravity", "audit-only question", "--from", "codex"], NO_CONNECTOR);
+  assert.equal(res.status, 3, res.output);
+  assert.doesNotMatch(res.output, /Consultation Response/);
+  assert.doesNotMatch(res.output, /No decision was recorded/);
+});
+
+test("dispatch with no connector reports pending", () => {
+  const dir = unconnected();
+  const res = runCli(dir, ["dispatch", "antigravity", "audit-only probe"], NO_CONNECTOR);
+  assert.equal(res.status, 3, res.output);
+  assert.match(res.output, /pending/);
+  assert.doesNotMatch(res.output, /finished|✅/);
+});
+
+test("starting an Antigravity conversation is not an answer", () => {
+  const { dir } = project(); // a connector exists, but agentapi only starts the conversation
+  const res = runCli(dir, ["consult", "antigravity", "Which queue?", "--from", "codex", "--auto-decide"], { COORDO_NO_NOTIFY: "1" });
+  assert.equal(res.status, 3, res.output);
+  assert.match(res.output, /conversation started, no result yet/);
+  assert.doesNotMatch(decisions(dir), /DEC-001/);
+  const invoked = runCli(dir, ["invoke", "antigravity", "Do the thing", "--from", "codex"], { COORDO_NO_NOTIFY: "1" });
+  assert.equal(invoked.status, 3, invoked.output);
+  assert.doesNotMatch(invoked.output, /finished|✅/);
+});
+
+for (const [agent, label] of [["claude", "claude"], ["codex", "codex"]]) {
+  test(`a crashed ${label} CLI fails consult --auto-decide and records no decision`, () => {
+    const { dir } = project();
+    const res = runCli(dir, ["consult", agent, "Redis or memcached?", "--from", "antigravity", "--auto-decide"], { FAKE_AGENT_CRASH: "1" });
+    assert.equal(res.status, 1, res.output);
+    assert.match(res.output, /Consultation with .* failed/);
+    assert.match(res.output, /No decision was recorded/);
+    assert.doesNotMatch(res.output, /Recorded and answered|Consultation Response/);
+    assert.doesNotMatch(decisions(dir), /DEC-001/);
+  });
+}
+
+test("an error result from a CLI that exited 0 is still a failure", () => {
+  const { dir } = project();
+  const res = runCli(dir, ["consult", "claude", "Redis or memcached?", "--from", "antigravity", "--auto-decide"], { FAKE_AGENT_IS_ERROR: "1" });
+  assert.equal(res.status, 1, res.output);
+  assert.doesNotMatch(decisions(dir), /DEC-001/);
+});
+
+test("an empty answer does not resolve a decision", () => {
+  const { dir } = project();
+  const res = runCli(dir, ["consult", "claude", "Redis or memcached?", "--from", "antigravity", "--auto-decide"], { FAKE_AGENT_BLANK: "1" });
+  assert.equal(res.status, 1, res.output);
+  assert.match(res.output, /empty answer/);
+  assert.doesNotMatch(decisions(dir), /DEC-001/);
+});
+
+test("invoke reports a crashed CLI as failed, not finished", () => {
+  const { dir } = project();
+  const res = runCli(dir, ["invoke", "claude", "Check this", "--from", "antigravity"], { FAKE_AGENT_CRASH: "1" });
+  assert.equal(res.status, 1, res.output);
+  assert.match(res.output, /claude failed/);
+  assert.doesNotMatch(res.output, /finished/);
+});
+
+test("a real answer still exits 0 and resolves the decision with that answer", () => {
+  const { dir } = project();
+  const res = runCli(dir, ["consult", "claude", "Redis or memcached?", "--from", "antigravity", "--auto-decide"]);
+  assert.equal(res.status, 0, res.output);
+  const shown = runCli(dir, ["decision", "show", "DEC-001"]).output;
+  assert.match(shown, /Status:\s+resolved/);
+  assert.match(shown, /recommend option A/);
+});
+
+test("lead still treats a closed ledger entry as success, whatever the adapter", () => {
+  const { dir } = project({ verifier: null });
+  runCli(dir, ["task", "add", "Implement the worker", "--from", "claude", "--to", "antigravity"]);
+  const res = runCli(dir, ["lead"], { COORDO_NO_NOTIFY: "1" });
+  assert.equal(res.status, 0, res.output);
+  assert.match(res.output, /TASK-001 closed by antigravity/);
 });

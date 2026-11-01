@@ -28,6 +28,10 @@ import { getDecisionRecord, listDecisionRecords, formatDecisionRecord, recordDel
 // Flags that never take a value, so `--dry-run "<goal>"` doesn't swallow the goal.
 const BOOLEAN_FLAGS = new Set(["full", "dry-run", "wait", "allow-dirty", "auto-decide"]);
 
+// dispatch, invoke and consult exit 0 with a result, 1 on failure, and this when the work was handed over
+// and no result exists yet. Same value as lead's "paused on a human": a person has to act.
+const EXIT_PENDING = 3;
+
 // Exit codes for `coordo lead` so scripts can tell why it stopped.
 const LEAD_EXIT_CODES = { complete: 0, planned: 0, paused: 3, stuck: 4 } as const;
 
@@ -146,6 +150,7 @@ Options:
   --allow-dirty      lead: start even with uncommitted changes (they are committed with the first closed task).
 
 Exit codes for lead: 0 complete, 3 paused on a human decision, 4 stuck (attempts or --max-steps used up).
+Exit codes for dispatch, invoke and consult: 0 the agent returned a result, 1 it failed, 3 handed over with no result yet.
 `);
 }
 
@@ -398,6 +403,12 @@ async function main() {
           console.log(`Would run: ${result.summary}\n--- prompt ---\n${prompt}`);
           break;
         }
+        if (result.outcome === "pending") {
+          console.log(`⏳ ${agent} (${result.mode}) pending: handed over, no result yet`);
+          if (result.summary) console.log(result.summary);
+          process.exitCode = EXIT_PENDING;
+          break;
+        }
         console.log(`${result.ok ? "✅" : "❌"} ${agent} (${result.mode}) ${result.ok ? "finished" : "failed"}${result.costUsd !== undefined ? `, $${result.costUsd.toFixed(2)}` : ""}`);
         if (result.summary) console.log(result.summary);
         if (result.logPath) console.log(`Log: ${result.logPath}`);
@@ -431,10 +442,17 @@ async function main() {
           break;
         }
 
+        if (result.outcome === "pending") { // no agent ran, so nothing to charge
+          console.log(`⏳ ${agent} pending: handed over, no result yet`);
+          if (result.summary) console.log(`\n${result.summary}`);
+          process.exitCode = EXIT_PENDING;
+          break;
+        }
+
         const cost = estimateCost(result.durationMs, result.costUsd, config.credits?.costPerSecondEstimate);
         deductCredits(root, caller, cost, "invoke", taskId, `Invoked ${agent}`, config);
 
-        console.log(`${result.ok ? "✅" : "❌"} ${agent} finished (${result.durationMs}ms, $${cost.toFixed(3)} credits)`);
+        console.log(`${result.ok ? "✅" : "❌"} ${agent} ${result.ok ? "finished" : "failed"} (${result.durationMs}ms, $${cost.toFixed(3)} credits)`);
         if (result.summary) console.log(`\n${result.summary}`);
         if (!result.ok) process.exitCode = 1;
         break;
@@ -465,8 +483,22 @@ async function main() {
           break;
         }
 
+        if (result.outcome === "pending") { // no agent ran, so nothing to charge and nothing to decide
+          console.log(`\n⏳ ${agent} has not answered: handed over, no result yet.${autoDecide ? " No decision was recorded." : ""}`);
+          if (result.summary) console.log(result.summary);
+          process.exitCode = EXIT_PENDING;
+          break;
+        }
+
         const cost = estimateCost(result.durationMs, result.costUsd, config.credits?.costPerSecondEstimate);
         deductCredits(root, caller, cost, "consult", undefined, `Consultation with ${agent}`, config);
+
+        // An error message or an empty reply is not an answer, and must never resolve a decision.
+        if (!result.ok || !result.summary.trim()) {
+          console.log(`\n❌ Consultation with ${agent} failed: ${result.summary.trim() || "it returned an empty answer"}${autoDecide ? "\nNo decision was recorded." : ""}`);
+          process.exitCode = 1;
+          break;
+        }
 
         if (autoDecide) {
           const decId = await addDecision(root, question, caller, agent, context);

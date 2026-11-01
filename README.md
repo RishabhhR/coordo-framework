@@ -142,6 +142,8 @@ Tasks are then addressed `--to architect`, and the planner assigns work by each 
 | `command` | Any CLI you describe: `bin`, `args` with `{prompt}`, `{promptFile}`, `{root}` placeholders, or the prompt on stdin | Covered by tests with fake CLIs only; not verified against any specific third-party tool |
 | `handoff` | Nothing: writes the prompt to `.coordo/runs/…prompt.md`, notifies you, and waits for the task to close | Tested |
 
+`coordo dispatch`, `invoke` and `consult` exit `0` when an agent returned a result, `1` when it failed, and `3` when the work was handed over and no result exists yet: a handoff prompt, or an Antigravity conversation with no task to watch. `consult --auto-decide` resolves a decision only with a real, non-empty answer.
+
 ### Config reference
 
 | Key | Default | Meaning |
