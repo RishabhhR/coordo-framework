@@ -1,6 +1,6 @@
 {
   "name": "coordo",
-  "version": "0.3.1",
+  "version": "0.4.0",
   "description": "A shared git-tracked ledger and autonomous dispatcher that lets several AI coding agents (Claude Code, Codex, Antigravity, or any CLI) work on one repo, across tools or as multiple roles inside one tool",
   "keywords": [
     "ai-agents",

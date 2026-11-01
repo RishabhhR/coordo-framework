@@ -1,5 +1,19 @@
 # Changelog
 
+## 0.4.0
+
+- **Autonomous agent-to-agent decisions in `coordo lead`.** Decisions addressed to enabled agents are dispatched autonomously to the recipient to deliberate and resolve with explicit rationale, bypassing human pauses unless addressed to a human.
+- **Inter-agent invocation & consultation.** `coordo invoke <agent> "<prompt>"` allows agents to programmatically dispatch peer agents. `coordo consult <agent> "<question>"` supports direct technical deliberation with `--auto-decide`.
+- **Credit & budget accounting.** Tracks compute/token expenditure across agents in `.coordo/state.json`, supports `coordo credit status`, `add`, `transfer`, `history`, and optional limit enforcement (`enforceLimits`).
+- **Decision-making ledger.** Captures problem statements, options considered, trade-offs, and rationale with `coordo decision show <id>` and `coordo decision log`.
+
+## 0.3.1
+
+- **Mongo connection errors say what is wrong.** TLS alert 80 (every Atlas node dropping the handshake) now reports that this machine's public IP is most likely not on the Atlas Network Access list instead of "check cluster availability"; bad credentials name the agent and where its credential lives; timeouts and DNS failures get their own advice. Messages never echo hosts, URIs or IP addresses. (TASK-046)
+- **The bundled Codex is found wherever ChatGPT.app keeps it.** Probes `Resources/codex-cli/bin/codex` and the older `Resources/codex` (also under `~/Applications`), requires an executable file, and when nothing is found says where it looked and that `codex.bin` in `.coordo/lead.json` fixes it. (TASK-021)
+- **`coordo mongo sync` can no longer corrupt the ledger.** It skips stale archive copies of items Mongo already holds, refuses (writing nothing) when an archive entry reuses an ID for a different task, and decides everything before writing. (TASK-045)
+- Test: the `lead --dry-run` assertion accepts the optional "routed" line that model-router adds.
+
 ## 0.3.0
 
 - **Agent profiles.** `agents` in `.coordo/lead.json` can be an object of named profiles (`adapter`, `model`, `role`, `instructions`, …), so one tool can play several agents, such as an architect, a builder and a reviewer all running through Claude Code. The list form and built-in names work as before.
