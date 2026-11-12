@@ -1,5 +1,5 @@
 {
-  "name": "@rishabhraj180402/coordo",
+  "name": "coordo",
   "version": "0.4.1",
   "description": "A shared git-tracked ledger and autonomous dispatcher that lets several AI coding agents (Claude Code, Codex, Antigravity, or any CLI) work on one repo, across tools or as multiple roles inside one tool",
   "keywords": [
@@ -15,11 +15,11 @@
   "author": "Rishabh Raj",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/RishabhhR/coordo.git"
+    "url": "git+https://github.com/RishabhhR/coordo-framework.git"
   },
-  "homepage": "https://github.com/RishabhhR/coordo#readme",
+  "homepage": "https://github.com/RishabhhR/coordo-framework#readme",
   "bugs": {
-    "url": "https://github.com/RishabhhR/coordo/issues"
+    "url": "https://github.com/RishabhhR/coordo-framework/issues"
   },
   "type": "module",
   "engines": {

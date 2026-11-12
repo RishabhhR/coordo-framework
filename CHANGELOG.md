@@ -2,6 +2,7 @@
 
 ## 0.4.1
 
+- **Simpler npm install name.** The public package is available as `coordo`, with the scoped package name retained as a separate install path.
 - **Peer calls no longer report false success.** `dispatch`, `invoke` and `consult` now distinguish a real answer, a pending handoff and a failure, with exit codes 0, 3 and 1. Before, handing a prompt to a human, or merely starting an Antigravity conversation, reported success with exit 0. (TASK-057)
 - **`consult --auto-decide` only resolves a decision with a real answer.** It used to record whatever came back, including "prompt written to ...", a crashed CLI's error text, an API error or an empty reply. On anything else it now records nothing.
 - Nothing is charged when no agent ran. A failed `invoke` now says failed, not finished.

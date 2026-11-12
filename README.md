@@ -30,13 +30,19 @@ Requires Node.js 20 or newer and git.
 
 Install globally from npm:
 ```bash
-npm install -g @rishabhraj180402/coordo
+npm install -g coordo
+```
+
+Or install in a project and run it with `npx`:
+```bash
+npm install coordo
+npx coordo --help
 ```
 
 Or build from source:
 ```bash
-git clone https://github.com/RishabhhR/coordo
-cd coordo
+git clone https://github.com/RishabhhR/coordo-framework
+cd coordo-framework
 npm install          # installs dev tools and builds
 npm install -g .     # puts `coordo` on your PATH
 ```
