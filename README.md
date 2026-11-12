@@ -75,7 +75,7 @@ coordo task done TASK-001 --as codex --note "Verified with npm test"
 coordo mongo export --as codex --out /secure/backup/coordo.json
 ```
 
-Do not edit or commit `.coordo/ledger.md` after migration. It is retained as a read-only historical archive. Treat it as closed: `coordo mongo sync` skips stale copies of items Mongo already holds and refuses to run when an archive entry reuses an ID for a different task (see `docs/mongo-operations.md`, "Archived markdown ledgers and ID mapping"). If Mongo is unavailable, stop and report the incident; do not silently fall back to local writes. The public `agent-ledger` kit and the read-only cloud viewer must remain separate from private Mongo credentials and data.
+Do not edit or commit `.coordo/ledger.md` after migration. It is retained as a read-only historical archive. Treat it as closed: `coordo mongo sync` skips stale copies of items Mongo already holds and refuses to run when an archive entry reuses an ID for a different task (see `docs/mongo-operations.md`, "Archived markdown ledgers and ID mapping"). If Mongo is unavailable, stop and report the incident; do not silently fall back to local writes. Keep private Mongo credentials and data separate from the read-only cloud viewer and all published examples.
 
 Mongo indexes are no longer created or dropped on every CLI invocation. Migration creates the required indexes; run `mongo ensure-indexes` for explicit maintenance or repair. `mongo check` only issues a ping and reports latency.
 
