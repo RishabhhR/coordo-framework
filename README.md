@@ -30,12 +30,12 @@ Requires Node.js 20 or newer and git.
 
 Install globally from npm:
 ```bash
-npm install -g coordo
+npm install -g coordo-cli
 ```
 
 Or install in a project and run it with `npx`:
 ```bash
-npm install coordo
+npm install coordo-cli
 npx coordo --help
 ```
 
